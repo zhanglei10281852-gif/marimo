@@ -46,5 +46,14 @@ class Store(ABC):
         """
         return []
 
+    def rebind_notebook(self) -> None:
+        """Re-anchor any notebook-derived location after a rename/move.
+
+        Called when the running notebook's path changes. Path-based stores
+        (e.g. the default file store) relocate their backing directory;
+        remote or explicit-path stores can leave this as a no-op.
+        """
+        return
+
 
 StoreType = type[Store]

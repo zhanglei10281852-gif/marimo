@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -18,7 +19,6 @@ from marimo._utils.http import HTTPException, HTTPStatus
 
 if TYPE_CHECKING:
     from collections.abc import Generator
-    from pathlib import Path
 
 save_request = SaveNotebookRequest(
     cell_ids=["1"],
@@ -93,9 +93,78 @@ def test_successful_rename(app_file_manager: AppFileManager) -> None:
 
 def test_rename_exception(app_file_manager: AppFileManager) -> None:
     new_filename = "/invalid/path/new_filename.py"
+    original = app_file_manager.filename
     with pytest.raises(HTTPException) as e:
         app_file_manager.rename(new_filename)
     assert e.value.status_code == HTTPStatus.SERVER_ERROR
+    # Failed move must leave the pointer and the file where they were.
+    assert app_file_manager.filename == original
+    assert original is not None
+    assert os.path.exists(original)
+
+
+def test_rename_rolls_back_when_save_fails(
+    app_file_manager: AppFileManager, tmp_path: Path
+) -> None:
+    """A write failure after the move must restore the file and pointers."""
+    from marimo._session.notebook.storage import FilesystemStorage
+
+    class FailingWriteStorage(FilesystemStorage):
+        def write(self, path: Path, content: str) -> None:  # type: ignore[override]
+            if Path(path).name == "new_file.py":
+                raise OSError("simulated write failure")
+            super().write(path, content)
+
+    original = Path(app_file_manager.filename)  # type: ignore[arg-type]
+    original_content = original.read_text()
+    app_file_manager.storage = FailingWriteStorage()
+    new_path = tmp_path / "new_file.py"
+
+    with pytest.raises(OSError, match="simulated write failure"):
+        app_file_manager.rename(str(new_path))
+
+    # In-memory pointers restored.
+    assert Path(app_file_manager.filename) == original  # type: ignore[arg-type]
+    assert app_file_manager.app._app._filename == str(original)
+    # File restored at the old path, nothing left at the target.
+    assert original.exists()
+    assert original.read_text() == original_content
+    assert not new_path.exists()
+
+    # The session stays usable: after fixing the problem, the user can
+    # retry the rename.
+    retry_path = tmp_path / "renamed_ok.py"
+    app_file_manager.rename(str(retry_path))
+    assert Path(app_file_manager.filename) == retry_path  # type: ignore[arg-type]
+    assert retry_path.exists()
+
+
+def test_rename_storage_failure_leaves_session_intact(
+    app_file_manager: AppFileManager, tmp_path: Path
+) -> None:
+    """A failure during the storage move must not touch session state."""
+    from marimo._session.notebook.storage import FilesystemStorage
+
+    class FailingRenameStorage(FilesystemStorage):
+        def rename(self, old_path: Path, new_path: Path) -> None:  # type: ignore[override]
+            del old_path, new_path
+            raise PermissionError("simulated permission failure")
+
+    original = Path(app_file_manager.filename)  # type: ignore[arg-type]
+    app_file_manager.storage = FailingRenameStorage()
+    new_path = tmp_path / "new_file.py"
+
+    with pytest.raises(PermissionError):
+        app_file_manager.rename(str(new_path))
+
+    assert Path(app_file_manager.filename) == original  # type: ignore[arg-type]
+    assert original.exists()
+    assert not new_path.exists()
+    # Retry after restoring a working storage backend.
+    app_file_manager.storage = FilesystemStorage()
+    app_file_manager.rename(str(new_path))
+    assert Path(app_file_manager.filename) == new_path  # type: ignore[arg-type]
+    assert new_path.exists()
 
 
 def test_rename_create_new_file(app_file_manager: AppFileManager) -> None:

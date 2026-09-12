@@ -29,16 +29,18 @@ export function useUpdateFilename() {
       return null;
     }
 
-    updateQueryParams((params) => {
-      if (name === null) {
-        params.delete(KnownQueryParams.filePath);
-      } else {
-        params.set(KnownQueryParams.filePath, name);
-      }
-    });
-
     return sendRename({ filename: name })
       .then(() => {
+        // Only commit the new path to the URL and local state once the
+        // server has durably moved the file; on failure the page keeps
+        // pointing at the live path so the user can fix and retry.
+        updateQueryParams((params) => {
+          if (name === null) {
+            params.delete(KnownQueryParams.filePath);
+          } else {
+            params.set(KnownQueryParams.filePath, name);
+          }
+        });
         setFilename(name);
         // Set document title: app_title takes precedence, then filename, then default
         document.title =

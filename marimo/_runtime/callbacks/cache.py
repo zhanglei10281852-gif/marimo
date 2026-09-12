@@ -42,6 +42,11 @@ class CacheCallbacks:
         router.register(ClearCacheCommand, self.clear_cache)
         router.register(GetCacheInfoCommand, self.get_cache_info)
 
+    def rename_file(self, filename: str) -> None:
+        """Track the notebook's new path so teardown names the right export
+        manifest."""
+        self._notebook_filename = filename
+
     def teardown(self) -> None:
         """Flush pending cache writes; publish an export manifest if caching."""
         from marimo._save.loaders import (

@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -538,10 +539,51 @@ class SessionCacheManager:
         return True
 
     def rename_path(self, new_path: str | Path) -> None:
-        """Rename the path to the new path"""
-        self.stop()
+        """Rename the path to the new path.
+
+        The on-disk session snapshot is migrated from the old cache file to
+        the new one so a kernel restart right after the move restores the
+        session from the new path. Migration is best-effort: the old file is
+        never destroyed if the move fails, and cache writer failures never
+        propagate (they only disable the writer).
+        """
+        was_running = self.stop()
+
+        old_cache_file: Path | None = None
+        if self.path is not None:
+            old_cache_file = get_session_cache_file(Path(self.path))
+
         self.path = new_path
-        self.start()
+        new_cache_file = get_session_cache_file(Path(new_path))
+
+        if (
+            was_running
+            and old_cache_file is not None
+            and old_cache_file != new_cache_file
+            and old_cache_file.exists()
+        ):
+            try:
+                new_cache_file.parent.mkdir(parents=True, exist_ok=True)
+                if new_cache_file.exists():
+                    # A snapshot for the target name already exists; the next
+                    # writer tick overwrites it with the live session view, so
+                    # drop the now-orphaned snapshot from the old path.
+                    old_cache_file.unlink()
+                else:
+                    shutil.move(str(old_cache_file), str(new_cache_file))
+            except OSError as e:
+                LOGGER.warning(
+                    f"Failed to migrate session cache from "
+                    f"{old_cache_file} to {new_cache_file}: {e}"
+                )
+
+        try:
+            self.start()
+        except Exception as e:
+            LOGGER.error(
+                f"Failed to restart session cache writer at "
+                f"{new_cache_file}: {e}"
+            )
 
     def is_cache_hit(
         self, notebook_session: NotebookSessionV1, key: SessionCacheKey

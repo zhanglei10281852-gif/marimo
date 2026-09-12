@@ -319,7 +319,11 @@ class AppFileManager:
             The filename of the new file.
 
         Raises:
-            HTTPException: If rename fails or target exists
+            HTTPException: If rename fails or target exists. On any failure
+                (target exists, permission error, write error), both the
+                on-disk file and the in-memory state are restored to the
+                original path, so the session, watchers, and caches remain
+                usable and the user can retry.
         """
         new_path = Path(canonicalize_filename(str(new_filename)))
 
@@ -330,24 +334,65 @@ class AppFileManager:
             self._assert_path_does_not_exist(new_path)
             self._invalidate_autosaves()
 
-            if self._filename is not None:
-                self.storage.rename(self._filename, new_path)
+            previous_filename = self._filename
+            created_empty_file = False
+            if previous_filename is not None:
+                # Raises before any state changes on permission / cross-device
+                # errors.
+                self.storage.rename(previous_filename, new_path)
             else:
                 # Create new file for unnamed notebooks
                 self.storage.write(new_path, "")
+                created_empty_file = True
 
-            previous_filename = self._filename
+            # The durable file moved; flip the in-memory pointers.
             self._filename = new_path
             self.app._app._filename = str(new_path)
 
-            self._save_file(
-                new_path,
-                notebook=self.app.to_ir(),
-                persist=True,
-                previous_path=previous_filename,
-            )
+            try:
+                self._save_file(
+                    new_path,
+                    notebook=self.app.to_ir(),
+                    persist=True,
+                    previous_path=previous_filename,
+                )
+            except Exception:
+                # Roll the pointers and the file back so nothing is left
+                # half-renamed; the caller surfaces the error and the user
+                # can fix and retry.
+                self._rollback_rename(
+                    previous_filename=previous_filename,
+                    new_path=new_path,
+                    created_empty_file=created_empty_file,
+                )
+                raise
 
             return new_path.name
+
+    def _rollback_rename(
+        self,
+        *,
+        previous_filename: Path | None,
+        new_path: Path,
+        created_empty_file: bool,
+    ) -> None:
+        """Restore in-memory pointers and the file after a failed rename."""
+        self._filename = previous_filename
+        self.app._app._filename = (
+            str(previous_filename) if previous_filename is not None else None
+        )
+        try:
+            if previous_filename is not None:
+                self.storage.rename(new_path, previous_filename)
+            elif created_empty_file:
+                new_path.unlink(missing_ok=True)
+        except Exception:
+            LOGGER.exception(
+                "Failed to roll back rename from %s to %s; the notebook may "
+                "need to be moved back manually.",
+                previous_filename,
+                new_path,
+            )
 
     def read_layout_config(self) -> LayoutConfig | None:
         """Read layout configuration file.

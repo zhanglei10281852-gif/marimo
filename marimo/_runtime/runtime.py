@@ -133,6 +133,7 @@ from marimo._runtime.parent_poller import (
     start_parent_poller,
 )
 from marimo._runtime.redirect_streams import redirect_streams
+from marimo._runtime.reload.autoreload import is_non_user_module_path
 from marimo._runtime.reload.manager import AutoreloadManager
 from marimo._runtime.request_router import RequestRouter
 from marimo._runtime.runner import cell_runner, hook_context
@@ -584,9 +585,11 @@ class Kernel:
             patches.patch_pdb(self.debugger)
 
         self._module = module
+        # The sys.path entry this kernel owns so notebook-relative imports
+        # resolve against the notebook's directory (`""` stands for CWD when
+        # the notebook is unnamed). Swapped atomically in `rename_file`.
+        self._notebook_path_entry: str | None = None
         if self.app_metadata.filename is not None:
-            # TODO(akshayka): When a file is renamed / moved to another folder,
-            # we need to update sys.path.
             try:
                 notebook_directory = str(
                     normalize_path(
@@ -595,6 +598,7 @@ class Kernel:
                 )
                 if notebook_directory not in sys.path:
                     sys.path.insert(0, notebook_directory)
+                self._notebook_path_entry = notebook_directory
             except Exception as e:
                 LOGGER.warning(
                     "Failed to add directory to path (error %e)", str(e)
@@ -606,6 +610,7 @@ class Kernel:
             #   the marimo home directory, when using
             #      marimo edit (ie homepage)
             sys.path.insert(0, "")
+            self._notebook_path_entry = ""
 
         self.graph = dataflow.DirectedGraph()
         self.agent = Agent()
@@ -1803,14 +1808,169 @@ class Kernel:
 
     @kernel_tracer.start_as_current_span("rename_file")
     async def rename_file(self, filename: str) -> None:
+        old_filename = self.app_metadata.filename
+
+        # Retarget import resolution and drop modules imported from the old
+        # directory before flipping `__file__`, so cells re-run against the
+        # new location and never keep using a same-named old module.
+        evicted_module_names: set[str] = set()
+        if not is_pyodide():
+            self._retarget_import_path(filename)
+            evicted_module_names = self._evict_directory_modules(
+                old_filename, filename
+            )
+
         self.globals["__file__"] = filename
         self.app_metadata.filename = filename
+        # Keep sys.argv consistent for argparse-style consumers.
+        if self.app_metadata.argv is not None:
+            self.argv = [filename, *self.app_metadata.argv]
+            sys.argv = self.argv
+
         self.packages_callbacks.rename_file(filename)
+        self.cache_callbacks.rename_file(filename)
+        # Cache stores anchor themselves to the notebook directory lazily;
+        # move them onto the new path, migrating existing blobs.
+        self._rebind_cache_store()
+
         roots: set[CellId_t] = set()
-        for cell in self.graph.cells.values():
-            if "__file__" in cell.refs:
-                roots.add(cell.cell_id)
+        with self.graph.lock:
+            for cell in self.graph.cells.values():
+                if "__file__" in cell.refs or self._cell_imports_any(
+                    cell, evicted_module_names
+                ):
+                    roots.add(cell.cell_id)
         await self.maybe_autorun_cells(roots)
+
+    def _retarget_import_path(self, new_filename: str) -> None:
+        """Swap the notebook-directory sys.path entry to the new location."""
+        try:
+            new_directory = str(
+                normalize_path(pathlib.Path(new_filename).parent)
+            )
+        except Exception as e:
+            LOGGER.warning(
+                "Failed to compute new notebook directory (error %s)", str(e)
+            )
+            return
+
+        managed = self._notebook_path_entry
+        if managed is not None and managed != new_directory:
+            # Remove only the single entry this kernel inserted.
+            if managed in sys.path:
+                sys.path.remove(managed)
+        if new_directory not in sys.path:
+            sys.path.insert(0, new_directory)
+        self._notebook_path_entry = new_directory
+
+    @staticmethod
+    def _module_source_paths(module: Any) -> list[str]:
+        """Real on-disk paths backing a module.
+
+        A regular module contributes `__file__`; a namespace package
+        contributes its `__path__` entries.
+        """
+        paths: list[str] = []
+        file = getattr(module, "__file__", None)
+        if isinstance(file, str) and file:
+            try:
+                paths.append(os.path.realpath(file))
+            except OSError:
+                paths.append(file)
+        paths_attr = getattr(module, "__path__", None)
+        if paths_attr is not None:
+            for entry in paths_attr:
+                if isinstance(entry, str) and entry:
+                    try:
+                        paths.append(os.path.realpath(entry))
+                    except OSError:
+                        paths.append(entry)
+        return paths
+
+    def _evict_directory_modules(
+        self, old_filename: str | None, new_filename: str
+    ) -> set[str]:
+        """Remove user modules imported from the old notebook directory.
+
+        Clearing them from ``sys.modules`` forces subsequent ``import``
+        statements to re-resolve via ``sys.path`` against the new directory,
+        so a same-named module left behind in the old directory can't shadow
+        the new one. Third-party code (including a vendored ``.venv`` inside
+        the notebook's folder) is left alone. Autoreload bookkeeping for
+        evicted names is forgotten so the module watcher tracks only the
+        freshly imported files.
+        """
+        if old_filename is None:
+            return set()
+        try:
+            old_directory = normalize_path(pathlib.Path(old_filename).parent)
+            new_directory = normalize_path(pathlib.Path(new_filename).parent)
+        except Exception:
+            return set()
+        if old_directory == new_directory:
+            return set()
+
+        # Any user module the old sys.path entry could have produced must be
+        # re-resolved against the new entry — including modules that happen
+        # to live under both directories (e.g. the notebook moves one level
+        # up or down), otherwise a stale same-named module keeps being used.
+        old_prefix = os.path.normcase(str(old_directory)) + os.sep
+
+        evicted: dict[str, Any] = {}
+        for name, module in list(sys.modules.items()):
+            if module is None or name in {"__main__", "__mp_main__"}:
+                continue
+            source_paths = self._module_source_paths(module)
+            if not source_paths:
+                continue
+            normalized_paths = [
+                os.path.normcase(path) for path in source_paths
+            ]
+            if not all(
+                path.startswith(old_prefix) for path in normalized_paths
+            ):
+                continue
+            if any(is_non_user_module_path(path) for path in source_paths):
+                # stdlib/site-packages (e.g. a .venv under the notebook dir)
+                continue
+            evicted[name] = module
+
+        if not evicted:
+            return set()
+
+        reloader = self.autoreload_manager.reloader
+        if reloader is not None:
+            reloader.forget_modules(set(evicted), evicted)
+        for name in evicted:
+            sys.modules.pop(name, None)
+        return set(evicted)
+
+    @staticmethod
+    def _cell_imports_any(cell: CellImpl, module_names: set[str]) -> bool:
+        """Whether a cell imported one of the given sys.modules names."""
+        if not module_names:
+            return False
+        return any(
+            import_data.module in module_names
+            or import_data.imported_symbol in module_names
+            for import_data in cell.imports
+        )
+
+    def _rebind_cache_store(self) -> None:
+        """Re-anchor session caches to the new notebook directory."""
+        try:
+            cache_state = get_context().cache
+        except ContextNotInitializedError:
+            return
+
+        rebind = getattr(cache_state.store, "rebind_notebook", None)
+        if callable(rebind):
+            rebind()
+        for loader in cache_state.active_lazy_loaders.values():
+            lazy_store = getattr(loader, "store", None)
+            rebind = getattr(lazy_store, "rebind_notebook", None)
+            if callable(rebind):
+                rebind()
 
     @kernel_tracer.start_as_current_span("run_scratchpad")
     async def run_scratchpad(self, code: str) -> None:

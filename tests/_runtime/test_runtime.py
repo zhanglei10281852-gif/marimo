@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import os
 import pathlib
 import sys
 import textwrap
@@ -1857,6 +1858,185 @@ except NameError:
             assert k.graph.get_stale() == {er.cell_id}
             await k.run([er])
         assert k.globals["x"] == "foo"
+
+    async def test_rename_swaps_sys_path(self, tmp_path: pathlib.Path) -> None:
+        old_dir = tmp_path / "old"
+        new_dir = tmp_path / "moved"
+        old_dir.mkdir()
+        new_dir.mkdir()
+        saved_sys_path = sys.path[:]
+        try:
+            with mocked_kernel_session(
+                app_metadata=default_app_metadata(
+                    filename=str(old_dir / "nb.py")
+                ),
+            ) as tk:
+                k = tk.kernel
+                assert sys.path[0] == str(old_dir)
+                await k.rename_file(str(new_dir / "nb.py"))
+                assert str(old_dir) not in sys.path
+                assert sys.path[0] == str(new_dir)
+                assert k._notebook_path_entry == str(new_dir)
+                assert k.app_metadata.filename == str(new_dir / "nb.py")
+                assert k.globals["__file__"] == str(new_dir / "nb.py")
+        finally:
+            sys.path[:] = saved_sys_path
+
+    async def test_rename_retargets_imports_and_forgets_modules(
+        self, tmp_path: pathlib.Path, exec_req: ExecReqProvider
+    ) -> None:
+        modname = "rename_move_helper_module"
+        old_dir = tmp_path / "old"
+        new_dir = tmp_path / "moved"
+        old_dir.mkdir()
+        new_dir.mkdir()
+        (old_dir / f"{modname}.py").write_text("VALUE = 'old'\n")
+        (new_dir / f"{modname}.py").write_text("VALUE = 'new'\n")
+
+        user_config = {
+            **DEFAULT_CONFIG,
+            "runtime": {
+                **DEFAULT_CONFIG["runtime"],
+                "auto_reload": "lazy",
+            },
+        }
+        saved_sys_path = sys.path[:]
+        try:
+            with mocked_kernel_session(
+                app_metadata=default_app_metadata(
+                    filename=str(old_dir / "nb.py")
+                ),
+                user_config=user_config,  # type: ignore[arg-type]
+                # Lazy mode keeps the cell from auto-running during rename,
+                # so the evicted sys.modules state is observable.
+                reactive_mode="lazy",
+            ) as tk:
+                k = tk.kernel
+                await k.run(
+                    [
+                        er := exec_req.get(
+                            f"import {modname}\nvalue = {modname}.VALUE"
+                        )
+                    ]
+                )
+                assert k.globals["value"] == "old"
+                assert (
+                    pathlib.Path(sys.modules[modname].__file__).parent
+                    == old_dir
+                )
+
+                reloader = k.autoreload_manager.reloader
+                assert reloader is not None
+
+                await k.rename_file(str(new_dir / "nb.py"))
+
+                # Import resolution now points at the new directory.
+                assert str(old_dir) not in sys.path
+                assert sys.path[0] == str(new_dir)
+                # The old module is evicted and forgotten by autoreload.
+                assert modname not in sys.modules
+                assert modname not in reloader.modules_mtimes
+                assert modname not in reloader.stale_modules
+                # Lazy mode marks the importing cell stale instead of
+                # re-running it during the rename.
+                assert er.cell_id in k.graph.get_stale()
+
+                # A subsequent cell re-imports from the new directory, never
+                # picking up the same-named module left in the old directory.
+                await k.run([er])
+                assert k.globals["value"] == "new"
+                new_module = sys.modules[modname]
+                assert pathlib.Path(new_module.__file__).parent == new_dir
+                # The reloader tracks the new file, not the old one.
+                assert (
+                    reloader.modules_mtimes[modname]
+                    == os.stat(new_module.__file__).st_mtime
+                )
+        finally:
+            sys.modules.pop(modname, None)
+            sys.path[:] = saved_sys_path
+
+    async def test_rename_keeps_vendored_third_party_modules(
+        self, tmp_path: pathlib.Path, exec_req: ExecReqProvider, monkeypatch
+    ) -> None:
+        """A dependency vendored under the notebook dir (e.g. .venv) is not
+        evicted when the notebook moves.
+        """
+        from marimo._runtime.reload import autoreload
+
+        modname = "rename_vendored_dep_module"
+        old_dir = tmp_path / "proj"
+        vendor = old_dir / ".venv" / "lib" / "vendor"
+        new_dir = old_dir / "moved"
+        old_dir.mkdir()
+        vendor.mkdir(parents=True)
+        new_dir.mkdir()
+        (vendor / f"{modname}.py").write_text("VALUE = 1\n")
+
+        vendor_root = os.path.normcase(str(vendor.resolve())) + os.sep
+        monkeypatch.setattr(
+            autoreload,
+            "_non_user_module_roots",
+            lambda: (vendor_root,),
+        )
+
+        saved_sys_path = sys.path[:]
+        try:
+            sys.path.append(str(vendor))
+            with mocked_kernel_session(
+                app_metadata=default_app_metadata(
+                    filename=str(old_dir / "nb.py")
+                ),
+            ) as tk:
+                k = tk.kernel
+                await k.run([exec_req.get(f"import {modname}")])
+                assert modname in sys.modules
+
+                await k.rename_file(str(new_dir / "nb.py"))
+
+                # Third-party module survives; only the notebook-dir entry
+                # moved.
+                assert modname in sys.modules
+                assert str(old_dir) not in sys.path
+                assert sys.path[0] == str(new_dir)
+        finally:
+            sys.modules.pop(modname, None)
+            sys.path[:] = saved_sys_path
+
+    async def test_rename_migrates_default_cache_directory(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        from marimo._save.stores.file import FileStore
+
+        old_dir = tmp_path / "old"
+        new_dir = tmp_path / "moved"
+        old_dir.mkdir()
+        new_dir.mkdir()
+        saved_sys_path = sys.path[:]
+        try:
+            with mocked_kernel_session(
+                app_metadata=default_app_metadata(
+                    filename=str(old_dir / "nb.py")
+                ),
+            ) as tk:
+                store = tk.ctx.cache.store
+                if not isinstance(store, FileStore):
+                    pytest.skip("default file cache store not configured")
+
+                assert store.put("P_rename.bin", b"payload")
+                old_blob = old_dir / "__marimo__" / "cache" / "P_rename.bin"
+                assert old_blob.exists()
+
+                await tk.kernel.rename_file(str(new_dir / "nb.py"))
+
+                assert not old_blob.exists()
+                new_blob = new_dir / "__marimo__" / "cache" / "P_rename.bin"
+                assert new_blob.exists()
+                assert new_blob.read_bytes() == b"payload"
+                # New writes/reads land at the new path.
+                assert store.hit("P_rename.bin")
+        finally:
+            sys.path[:] = saved_sys_path
 
     async def test_temporaries_deleted(
         self, k: Kernel, exec_req: ExecReqProvider

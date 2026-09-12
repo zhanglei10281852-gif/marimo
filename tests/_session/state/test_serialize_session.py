@@ -1003,6 +1003,61 @@ class TestSessionCacheManager:
             assert manager.session_cache_writer != old_writer
             assert manager.path == new_path
 
+    async def test_rename_path_migrates_cache_file(
+        self, session_view: SessionView
+    ):
+        """The on-disk snapshot moves to the new path so a kernel restart
+        restores the session from the new location."""
+        view = session_view
+        doc = _make_document()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            old_path = tmp / "old" / "old.py"
+            new_path = tmp / "moved" / "new.py"
+            old_cache = get_session_cache_file(old_path)
+            new_cache = get_session_cache_file(new_path)
+            old_cache.parent.mkdir(parents=True, exist_ok=True)
+            old_cache.write_text('{"version": "1"}')
+
+            manager = SessionCacheManager(view, doc, old_path, 60)
+            manager.start()
+            try:
+                manager.rename_path(new_path)
+                assert manager.path == new_path
+                assert not old_cache.exists()
+                assert new_cache.exists()
+                assert new_cache.read_text() == '{"version": "1"}'
+            finally:
+                manager.stop()
+
+    async def test_rename_path_keeps_old_cache_when_target_exists(
+        self, session_view: SessionView
+    ):
+        """An existing snapshot at the target wins; the orphaned old file is
+        dropped and the writer keeps running at the new path."""
+        view = session_view
+        doc = _make_document()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            old_path = tmp / "old" / "old.py"
+            new_path = tmp / "moved" / "new.py"
+            old_cache = get_session_cache_file(old_path)
+            new_cache = get_session_cache_file(new_path)
+            old_cache.parent.mkdir(parents=True, exist_ok=True)
+            new_cache.parent.mkdir(parents=True, exist_ok=True)
+            old_cache.write_text("old")
+            new_cache.write_text("new")
+
+            manager = SessionCacheManager(view, doc, old_path, 60)
+            manager.start()
+            try:
+                manager.rename_path(new_path)
+                assert not old_cache.exists()
+                assert new_cache.read_text() == "new"
+                assert manager.session_cache_writer is not None
+            finally:
+                manager.stop()
+
     def test_read_session_view_no_path(self, session_view: SessionView):
         """Test reading session view without path"""
         view = session_view

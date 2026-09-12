@@ -112,6 +112,23 @@ def _normalized_path(f: str) -> str:
     return os.path.normcase(os.path.realpath(f))
 
 
+def is_non_user_module_path(path: str) -> bool:
+    """True for files living in stdlib or site-packages (or a vendored copy).
+
+    Used to distinguish user code from third-party modules regardless of the
+    current working directory (e.g. a `.venv` inside the notebook's folder).
+    """
+    return _normalized_path(path).startswith(_non_user_module_roots())
+
+
+def is_user_module(module: types.ModuleType) -> bool:
+    """True when a module's source lives outside stdlib/site-packages."""
+    f = safe_getattr(module, "__file__", None)
+    if not f:
+        return False
+    return not is_non_user_module_path(f)
+
+
 def modules_imported_by_cell(
     cell: CellImpl, sys_modules: dict[str, types.ModuleType]
 ) -> set[str]:
@@ -216,10 +233,7 @@ class ModuleReloader:
         Editable installs (e.g. `pip install -e .`) point `__file__` at the
         source tree, so they are correctly classified as user code.
         """
-        f = safe_getattr(module, "__file__", None)
-        if not f:
-            return False
-        return not _normalized_path(f).startswith(_non_user_module_roots())
+        return is_user_module(module)
 
     def filename_and_mtime(
         self, module: types.ModuleType
@@ -380,6 +394,34 @@ class ModuleReloader:
         return self._module_dependency_finder.find_dependencies(
             module, excludes
         )
+
+    def forget_modules(
+        self,
+        modnames: set[str],
+        modules: dict[str, types.ModuleType] | None = None,
+    ) -> None:
+        """Drop all reload bookkeeping for the given module names.
+
+        Used when a notebook is moved to another directory and the named
+        modules are evicted from ``sys.modules`` so they re-resolve against
+        the new location. Without this, stale mtimes / skip caches keyed by
+        module name would treat the freshly imported files as old modules.
+        """
+        if not modnames:
+            return
+        with self.lock:
+            for name in modnames:
+                self.modules_mtimes.pop(name, None)
+                self.stale_modules.discard(name)
+                self._skip.pop(name, None)
+
+            for name, module in (modules or {}).items():
+                if name not in modnames:
+                    continue
+                file = safe_getattr(module, "__file__", None)
+                if file is not None:
+                    self.failed.pop(file, None)
+                    self._module_dependency_finder.evict_from_cache(module)
 
 
 def update_function(old: object, new: object) -> None:

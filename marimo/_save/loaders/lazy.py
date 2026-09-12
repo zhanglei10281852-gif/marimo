@@ -501,6 +501,12 @@ class LazyStore(Store):
     def export_keys(self) -> list[str]:
         return sorted(self._written_keys | self._touched_keys)
 
+    def rebind_notebook(self) -> None:
+        """Relocate the inner store after a notebook rename/move."""
+        rebind = getattr(self._inner, "rebind_notebook", None)
+        if callable(rebind):
+            rebind()
+
 
 class WasmLazyStore(LazyStore):
     """WASM store: writes to a shared in-session `DictStore`; reads fall

@@ -1,0 +1,1000 @@
+﻿diff --git a/evidence/model.patch b/evidence/model.patch
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/frontend/src/core/saving/filename.ts b/frontend/src/core/saving/filename.ts
+index 55f592396..984f15f2a 100644
+--- a/frontend/src/core/saving/filename.ts
++++ b/frontend/src/core/saving/filename.ts
+@@ -29,16 +29,18 @@ export function useUpdateFilename() {
+       return null;
+     }
+ 
+-    updateQueryParams((params) => {
+-      if (name === null) {
+-        params.delete(KnownQueryParams.filePath);
+-      } else {
+-        params.set(KnownQueryParams.filePath, name);
+-      }
+-    });
+-
+     return sendRename({ filename: name })
+       .then(() => {
++        // Only commit the new path to the URL and local state once the
++        // server has durably moved the file; on failure the page keeps
++        // pointing at the live path so the user can fix and retry.
++        updateQueryParams((params) => {
++          if (name === null) {
++            params.delete(KnownQueryParams.filePath);
++          } else {
++            params.set(KnownQueryParams.filePath, name);
++          }
++        });
+         setFilename(name);
+         // Set document title: app_title takes precedence, then filename, then default
+         document.title =
+diff --git a/marimo/_runtime/callbacks/cache.py b/marimo/_runtime/callbacks/cache.py
+index 29591a84e..42d0adda5 100644
+--- a/marimo/_runtime/callbacks/cache.py
++++ b/marimo/_runtime/callbacks/cache.py
+@@ -42,6 +42,11 @@ class CacheCallbacks:
+         router.register(ClearCacheCommand, self.clear_cache)
+         router.register(GetCacheInfoCommand, self.get_cache_info)
+ 
++    def rename_file(self, filename: str) -> None:
++        """Track the notebook's new path so teardown names the right export
++        manifest."""
++        self._notebook_filename = filename
++
+     def teardown(self) -> None:
+         """Flush pending cache writes; publish an export manifest if caching."""
+         from marimo._save.loaders import (
+diff --git a/marimo/_runtime/reload/autoreload.py b/marimo/_runtime/reload/autoreload.py
+index f7b4553d0..684173839 100644
+--- a/marimo/_runtime/reload/autoreload.py
++++ b/marimo/_runtime/reload/autoreload.py
+@@ -112,6 +112,23 @@ def _normalized_path(f: str) -> str:
+     return os.path.normcase(os.path.realpath(f))
+ 
+ 
++def is_non_user_module_path(path: str) -> bool:
++    """True for files living in stdlib or site-packages (or a vendored copy).
++
++    Used to distinguish user code from third-party modules regardless of the
++    current working directory (e.g. a `.venv` inside the notebook's folder).
++    """
++    return _normalized_path(path).startswith(_non_user_module_roots())
++
++
++def is_user_module(module: types.ModuleType) -> bool:
++    """True when a module's source lives outside stdlib/site-packages."""
++    f = safe_getattr(module, "__file__", None)
++    if not f:
++        return False
++    return not is_non_user_module_path(f)
++
++
+ def modules_imported_by_cell(
+     cell: CellImpl, sys_modules: dict[str, types.ModuleType]
+ ) -> set[str]:
+@@ -216,10 +233,7 @@ class ModuleReloader:
+         Editable installs (e.g. `pip install -e .`) point `__file__` at the
+         source tree, so they are correctly classified as user code.
+         """
+-        f = safe_getattr(module, "__file__", None)
+-        if not f:
+-            return False
+-        return not _normalized_path(f).startswith(_non_user_module_roots())
++        return is_user_module(module)
+ 
+     def filename_and_mtime(
+         self, module: types.ModuleType
+@@ -381,6 +395,34 @@ class ModuleReloader:
+             module, excludes
+         )
+ 
++    def forget_modules(
++        self,
++        modnames: set[str],
++        modules: dict[str, types.ModuleType] | None = None,
++    ) -> None:
++        """Drop all reload bookkeeping for the given module names.
++
++        Used when a notebook is moved to another directory and the named
++        modules are evicted from ``sys.modules`` so they re-resolve against
++        the new location. Without this, stale mtimes / skip caches keyed by
++        module name would treat the freshly imported files as old modules.
++        """
++        if not modnames:
++            return
++        with self.lock:
++            for name in modnames:
++                self.modules_mtimes.pop(name, None)
++                self.stale_modules.discard(name)
++                self._skip.pop(name, None)
++
++            for name, module in (modules or {}).items():
++                if name not in modnames:
++                    continue
++                file = safe_getattr(module, "__file__", None)
++                if file is not None:
++                    self.failed.pop(file, None)
++                    self._module_dependency_finder.evict_from_cache(module)
++
+ 
+ def update_function(old: object, new: object) -> None:
+     """Upgrade the code object of a function"""
+diff --git a/marimo/_runtime/runtime.py b/marimo/_runtime/runtime.py
+index ccead9738..37dd849d4 100644
+--- a/marimo/_runtime/runtime.py
++++ b/marimo/_runtime/runtime.py
+@@ -133,6 +133,7 @@ from marimo._runtime.parent_poller import (
+     start_parent_poller,
+ )
+ from marimo._runtime.redirect_streams import redirect_streams
++from marimo._runtime.reload.autoreload import is_non_user_module_path
+ from marimo._runtime.reload.manager import AutoreloadManager
+ from marimo._runtime.request_router import RequestRouter
+ from marimo._runtime.runner import cell_runner, hook_context
+@@ -584,9 +585,11 @@ class Kernel:
+             patches.patch_pdb(self.debugger)
+ 
+         self._module = module
++        # The sys.path entry this kernel owns so notebook-relative imports
++        # resolve against the notebook's directory (`""` stands for CWD when
++        # the notebook is unnamed). Swapped atomically in `rename_file`.
++        self._notebook_path_entry: str | None = None
+         if self.app_metadata.filename is not None:
+-            # TODO(akshayka): When a file is renamed / moved to another folder,
+-            # we need to update sys.path.
+             try:
+                 notebook_directory = str(
+                     normalize_path(
+@@ -595,6 +598,7 @@ class Kernel:
+                 )
+                 if notebook_directory not in sys.path:
+                     sys.path.insert(0, notebook_directory)
++                self._notebook_path_entry = notebook_directory
+             except Exception as e:
+                 LOGGER.warning(
+                     "Failed to add directory to path (error %e)", str(e)
+@@ -606,6 +610,7 @@ class Kernel:
+             #   the marimo home directory, when using
+             #      marimo edit (ie homepage)
+             sys.path.insert(0, "")
++            self._notebook_path_entry = ""
+ 
+         self.graph = dataflow.DirectedGraph()
+         self.agent = Agent()
+@@ -1803,15 +1808,170 @@ class Kernel:
+ 
+     @kernel_tracer.start_as_current_span("rename_file")
+     async def rename_file(self, filename: str) -> None:
++        old_filename = self.app_metadata.filename
++
++        # Retarget import resolution and drop modules imported from the old
++        # directory before flipping `__file__`, so cells re-run against the
++        # new location and never keep using a same-named old module.
++        evicted_module_names: set[str] = set()
++        if not is_pyodide():
++            self._retarget_import_path(filename)
++            evicted_module_names = self._evict_directory_modules(
++                old_filename, filename
++            )
++
+         self.globals["__file__"] = filename
+         self.app_metadata.filename = filename
++        # Keep sys.argv consistent for argparse-style consumers.
++        if self.app_metadata.argv is not None:
++            self.argv = [filename, *self.app_metadata.argv]
++            sys.argv = self.argv
++
+         self.packages_callbacks.rename_file(filename)
++        self.cache_callbacks.rename_file(filename)
++        # Cache stores anchor themselves to the notebook directory lazily;
++        # move them onto the new path, migrating existing blobs.
++        self._rebind_cache_store()
++
+         roots: set[CellId_t] = set()
+-        for cell in self.graph.cells.values():
+-            if "__file__" in cell.refs:
+-                roots.add(cell.cell_id)
++        with self.graph.lock:
++            for cell in self.graph.cells.values():
++                if "__file__" in cell.refs or self._cell_imports_any(
++                    cell, evicted_module_names
++                ):
++                    roots.add(cell.cell_id)
+         await self.maybe_autorun_cells(roots)
+ 
++    def _retarget_import_path(self, new_filename: str) -> None:
++        """Swap the notebook-directory sys.path entry to the new location."""
++        try:
++            new_directory = str(
++                normalize_path(pathlib.Path(new_filename).parent)
++            )
++        except Exception as e:
++            LOGGER.warning(
++                "Failed to compute new notebook directory (error %s)", str(e)
++            )
++            return
++
++        managed = self._notebook_path_entry
++        if managed is not None and managed != new_directory:
++            # Remove only the single entry this kernel inserted.
++            if managed in sys.path:
++                sys.path.remove(managed)
++        if new_directory not in sys.path:
++            sys.path.insert(0, new_directory)
++        self._notebook_path_entry = new_directory
++
++    @staticmethod
++    def _module_source_paths(module: Any) -> list[str]:
++        """Real on-disk paths backing a module.
++
++        A regular module contributes `__file__`; a namespace package
++        contributes its `__path__` entries.
++        """
++        paths: list[str] = []
++        file = getattr(module, "__file__", None)
++        if isinstance(file, str) and file:
++            try:
++                paths.append(os.path.realpath(file))
++            except OSError:
++                paths.append(file)
++        paths_attr = getattr(module, "__path__", None)
++        if paths_attr is not None:
++            for entry in paths_attr:
++                if isinstance(entry, str) and entry:
++                    try:
++                        paths.append(os.path.realpath(entry))
++                    except OSError:
++                        paths.append(entry)
++        return paths
++
++    def _evict_directory_modules(
++        self, old_filename: str | None, new_filename: str
++    ) -> set[str]:
++        """Remove user modules imported from the old notebook directory.
++
++        Clearing them from ``sys.modules`` forces subsequent ``import``
++        statements to re-resolve via ``sys.path`` against the new directory,
++        so a same-named module left behind in the old directory can't shadow
++        the new one. Third-party code (including a vendored ``.venv`` inside
++        the notebook's folder) is left alone. Autoreload bookkeeping for
++        evicted names is forgotten so the module watcher tracks only the
++        freshly imported files.
++        """
++        if old_filename is None:
++            return set()
++        try:
++            old_directory = normalize_path(pathlib.Path(old_filename).parent)
++            new_directory = normalize_path(pathlib.Path(new_filename).parent)
++        except Exception:
++            return set()
++        if old_directory == new_directory:
++            return set()
++
++        # Any user module the old sys.path entry could have produced must be
++        # re-resolved against the new entry — including modules that happen
++        # to live under both directories (e.g. the notebook moves one level
++        # up or down), otherwise a stale same-named module keeps being used.
++        old_prefix = os.path.normcase(str(old_directory)) + os.sep
++
++        evicted: dict[str, Any] = {}
++        for name, module in list(sys.modules.items()):
++            if module is None or name in {"__main__", "__mp_main__"}:
++                continue
++            source_paths = self._module_source_paths(module)
++            if not source_paths:
++                continue
++            normalized_paths = [
++                os.path.normcase(path) for path in source_paths
++            ]
++            if not all(
++                path.startswith(old_prefix) for path in normalized_paths
++            ):
++                continue
++            if any(is_non_user_module_path(path) for path in source_paths):
++                # stdlib/site-packages (e.g. a .venv under the notebook dir)
++                continue
++            evicted[name] = module
++
++        if not evicted:
++            return set()
++
++        reloader = self.autoreload_manager.reloader
++        if reloader is not None:
++            reloader.forget_modules(set(evicted), evicted)
++        for name in evicted:
++            sys.modules.pop(name, None)
++        return set(evicted)
++
++    @staticmethod
++    def _cell_imports_any(cell: CellImpl, module_names: set[str]) -> bool:
++        """Whether a cell imported one of the given sys.modules names."""
++        if not module_names:
++            return False
++        return any(
++            import_data.module in module_names
++            or import_data.imported_symbol in module_names
++            for import_data in cell.imports
++        )
++
++    def _rebind_cache_store(self) -> None:
++        """Re-anchor session caches to the new notebook directory."""
++        try:
++            cache_state = get_context().cache
++        except ContextNotInitializedError:
++            return
++
++        rebind = getattr(cache_state.store, "rebind_notebook", None)
++        if callable(rebind):
++            rebind()
++        for loader in cache_state.active_lazy_loaders.values():
++            lazy_store = getattr(loader, "store", None)
++            rebind = getattr(lazy_store, "rebind_notebook", None)
++            if callable(rebind):
++                rebind()
++
+     @kernel_tracer.start_as_current_span("run_scratchpad")
+     async def run_scratchpad(self, code: str) -> None:
+         roots = {SCRATCH_CELL_ID}
+diff --git a/marimo/_save/loaders/lazy.py b/marimo/_save/loaders/lazy.py
+index 40376f02d..52cd5953d 100644
+--- a/marimo/_save/loaders/lazy.py
++++ b/marimo/_save/loaders/lazy.py
+@@ -501,6 +501,12 @@ class LazyStore(Store):
+     def export_keys(self) -> list[str]:
+         return sorted(self._written_keys | self._touched_keys)
+ 
++    def rebind_notebook(self) -> None:
++        """Relocate the inner store after a notebook rename/move."""
++        rebind = getattr(self._inner, "rebind_notebook", None)
++        if callable(rebind):
++            rebind()
++
+ 
+ class WasmLazyStore(LazyStore):
+     """WASM store: writes to a shared in-session `DictStore`; reads fall
+diff --git a/marimo/_save/stores/file.py b/marimo/_save/stores/file.py
+index 2adc31d74..9f0324054 100644
+--- a/marimo/_save/stores/file.py
++++ b/marimo/_save/stores/file.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ 
+ import os
+ import re
++import shutil
+ from pathlib import Path
+ 
+ from marimo import _loggers
+@@ -46,9 +47,14 @@ class FileStore(Store):
+     def __init__(self, save_path: str | None = None) -> None:
+         # Defer default path resolution until first use so that the runtime
+         # context (and __file__) is available.
++        self._explicit_save_path = save_path is not None
+         self._resolved_save_path: Path | None = (
+             Path(save_path) if save_path is not None else None
+         )
++        # True when the resolved path is the default `<dir>/__marimo__/cache`
++        # anchored to the notebook (vs. the CWD fallback or an explicit path),
++        # i.e. a directory this store owns and may migrate on rename.
++        self._anchored_to_notebook = False
+         self._initialized = False
+ 
+     @property
+@@ -60,12 +66,14 @@ class FileStore(Store):
+     def _default_save_path(self) -> Path:
+         root = notebook_dir()
+         if root is None:
++            self._anchored_to_notebook = False
+             return FALLBACK_SAVE_PATH
+ 
+         # Probe the write target, which `sys.pycache_prefix` can move out of
+         # the notebook's directory.
+         target = notebook_output_dir(root) / "cache"
+         if _writable_dir(target):
++            self._anchored_to_notebook = True
+             return target
+ 
+         LOGGER.warning(
+@@ -73,8 +81,57 @@ class FileStore(Store):
+             target,
+             FALLBACK_SAVE_PATH.resolve(),
+         )
++        self._anchored_to_notebook = False
+         return FALLBACK_SAVE_PATH
+ 
++    def rebind_notebook(self) -> None:
++        """Move onto the new notebook directory after a rename/move.
++
++        Explicitly configured stores stay put. A lazily-resolved default
++        store forgets its resolution so the next access anchors to the new
++        notebook directory; existing blobs are migrated along when the new
++        cache directory does not yet exist. Migration failures never break
++        the rename — the blobs simply stay at the old (now orphaned) path.
++        """
++        if self._explicit_save_path:
++            # An explicitly configured cache directory doesn't travel with
++            # the notebook.
++            return
++        if self._resolved_save_path is None or not self._anchored_to_notebook:
++            # Either never used (resolution will pick up the new `__file__`)
++            # or sitting on the shared CWD fallback.
++            self._resolved_save_path = None
++            self._initialized = False
++            return
++
++        old_path = self._resolved_save_path
++        new_path = self._compute_default_save_path()
++        self._resolved_save_path = None
++        self._initialized = False
++
++        if new_path is None or new_path == old_path:
++            return
++        try:
++            if old_path.exists() and not new_path.exists():
++                new_path.parent.mkdir(parents=True, exist_ok=True)
++                shutil.move(str(old_path), str(new_path))
++                self._resolved_save_path = new_path
++                self._anchored_to_notebook = True
++        except OSError as e:
++            LOGGER.warning(
++                "Failed to migrate cache directory %s to %s: %s",
++                old_path,
++                new_path,
++                e,
++            )
++
++    def _compute_default_save_path(self) -> Path | None:
++        """Resolve the default target without recording anchoring state."""
++        root = notebook_dir()
++        if root is None:
++            return None
++        return notebook_output_dir(root) / "cache"
++
+     def _init_save_path(self) -> None:
+         self.save_path.mkdir(parents=True, exist_ok=True)
+ 
+diff --git a/marimo/_save/stores/store.py b/marimo/_save/stores/store.py
+index b0c156a56..5d9e701ba 100644
+--- a/marimo/_save/stores/store.py
++++ b/marimo/_save/stores/store.py
+@@ -46,5 +46,14 @@ class Store(ABC):
+         """
+         return []
+ 
++    def rebind_notebook(self) -> None:
++        """Re-anchor any notebook-derived location after a rename/move.
++
++        Called when the running notebook's path changes. Path-based stores
++        (e.g. the default file store) relocate their backing directory;
++        remote or explicit-path stores can leave this as a no-op.
++        """
++        return
++
+ 
+ StoreType = type[Store]
+diff --git a/marimo/_session/notebook/file_manager.py b/marimo/_session/notebook/file_manager.py
+index e6be930e7..710a6180e 100644
+--- a/marimo/_session/notebook/file_manager.py
++++ b/marimo/_session/notebook/file_manager.py
+@@ -319,7 +319,11 @@ class AppFileManager:
+             The filename of the new file.
+ 
+         Raises:
+-            HTTPException: If rename fails or target exists
++            HTTPException: If rename fails or target exists. On any failure
++                (target exists, permission error, write error), both the
++                on-disk file and the in-memory state are restored to the
++                original path, so the session, watchers, and caches remain
++                usable and the user can retry.
+         """
+         new_path = Path(canonicalize_filename(str(new_filename)))
+ 
+@@ -330,25 +334,66 @@ class AppFileManager:
+             self._assert_path_does_not_exist(new_path)
+             self._invalidate_autosaves()
+ 
+-            if self._filename is not None:
+-                self.storage.rename(self._filename, new_path)
++            previous_filename = self._filename
++            created_empty_file = False
++            if previous_filename is not None:
++                # Raises before any state changes on permission / cross-device
++                # errors.
++                self.storage.rename(previous_filename, new_path)
+             else:
+                 # Create new file for unnamed notebooks
+                 self.storage.write(new_path, "")
++                created_empty_file = True
+ 
+-            previous_filename = self._filename
++            # The durable file moved; flip the in-memory pointers.
+             self._filename = new_path
+             self.app._app._filename = str(new_path)
+ 
+-            self._save_file(
+-                new_path,
+-                notebook=self.app.to_ir(),
+-                persist=True,
+-                previous_path=previous_filename,
+-            )
++            try:
++                self._save_file(
++                    new_path,
++                    notebook=self.app.to_ir(),
++                    persist=True,
++                    previous_path=previous_filename,
++                )
++            except Exception:
++                # Roll the pointers and the file back so nothing is left
++                # half-renamed; the caller surfaces the error and the user
++                # can fix and retry.
++                self._rollback_rename(
++                    previous_filename=previous_filename,
++                    new_path=new_path,
++                    created_empty_file=created_empty_file,
++                )
++                raise
+ 
+             return new_path.name
+ 
++    def _rollback_rename(
++        self,
++        *,
++        previous_filename: Path | None,
++        new_path: Path,
++        created_empty_file: bool,
++    ) -> None:
++        """Restore in-memory pointers and the file after a failed rename."""
++        self._filename = previous_filename
++        self.app._app._filename = (
++            str(previous_filename) if previous_filename is not None else None
++        )
++        try:
++            if previous_filename is not None:
++                self.storage.rename(new_path, previous_filename)
++            elif created_empty_file:
++                new_path.unlink(missing_ok=True)
++        except Exception:
++            LOGGER.exception(
++                "Failed to roll back rename from %s to %s; the notebook may "
++                "need to be moved back manually.",
++                previous_filename,
++                new_path,
++            )
++
+     def read_layout_config(self) -> LayoutConfig | None:
+         """Read layout configuration file.
+ 
+diff --git a/marimo/_session/state/serialize.py b/marimo/_session/state/serialize.py
+index 3e962f822..ea6f77fea 100644
+--- a/marimo/_session/state/serialize.py
++++ b/marimo/_session/state/serialize.py
+@@ -5,6 +5,7 @@ import asyncio
+ import json
+ import os
+ import re
++import shutil
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Any, cast
+@@ -538,10 +539,51 @@ class SessionCacheManager:
+         return True
+ 
+     def rename_path(self, new_path: str | Path) -> None:
+-        """Rename the path to the new path"""
+-        self.stop()
++        """Rename the path to the new path.
++
++        The on-disk session snapshot is migrated from the old cache file to
++        the new one so a kernel restart right after the move restores the
++        session from the new path. Migration is best-effort: the old file is
++        never destroyed if the move fails, and cache writer failures never
++        propagate (they only disable the writer).
++        """
++        was_running = self.stop()
++
++        old_cache_file: Path | None = None
++        if self.path is not None:
++            old_cache_file = get_session_cache_file(Path(self.path))
++
+         self.path = new_path
+-        self.start()
++        new_cache_file = get_session_cache_file(Path(new_path))
++
++        if (
++            was_running
++            and old_cache_file is not None
++            and old_cache_file != new_cache_file
++            and old_cache_file.exists()
++        ):
++            try:
++                new_cache_file.parent.mkdir(parents=True, exist_ok=True)
++                if new_cache_file.exists():
++                    # A snapshot for the target name already exists; the next
++                    # writer tick overwrites it with the live session view, so
++                    # drop the now-orphaned snapshot from the old path.
++                    old_cache_file.unlink()
++                else:
++                    shutil.move(str(old_cache_file), str(new_cache_file))
++            except OSError as e:
++                LOGGER.warning(
++                    f"Failed to migrate session cache from "
++                    f"{old_cache_file} to {new_cache_file}: {e}"
++                )
++
++        try:
++            self.start()
++        except Exception as e:
++            LOGGER.error(
++                f"Failed to restart session cache writer at "
++                f"{new_cache_file}: {e}"
++            )
+ 
+     def is_cache_hit(
+         self, notebook_session: NotebookSessionV1, key: SessionCacheKey
+diff --git a/tests/_runtime/test_runtime.py b/tests/_runtime/test_runtime.py
+index c564e795a..ce4fd2403 100644
+--- a/tests/_runtime/test_runtime.py
++++ b/tests/_runtime/test_runtime.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ 
+ import asyncio
+ import copy
++import os
+ import pathlib
+ import sys
+ import textwrap
+@@ -1858,6 +1859,185 @@ except NameError:
+             await k.run([er])
+         assert k.globals["x"] == "foo"
+ 
++    async def test_rename_swaps_sys_path(self, tmp_path: pathlib.Path) -> None:
++        old_dir = tmp_path / "old"
++        new_dir = tmp_path / "moved"
++        old_dir.mkdir()
++        new_dir.mkdir()
++        saved_sys_path = sys.path[:]
++        try:
++            with mocked_kernel_session(
++                app_metadata=default_app_metadata(
++                    filename=str(old_dir / "nb.py")
++                ),
++            ) as tk:
++                k = tk.kernel
++                assert sys.path[0] == str(old_dir)
++                await k.rename_file(str(new_dir / "nb.py"))
++                assert str(old_dir) not in sys.path
++                assert sys.path[0] == str(new_dir)
++                assert k._notebook_path_entry == str(new_dir)
++                assert k.app_metadata.filename == str(new_dir / "nb.py")
++                assert k.globals["__file__"] == str(new_dir / "nb.py")
++        finally:
++            sys.path[:] = saved_sys_path
++
++    async def test_rename_retargets_imports_and_forgets_modules(
++        self, tmp_path: pathlib.Path, exec_req: ExecReqProvider
++    ) -> None:
++        modname = "rename_move_helper_module"
++        old_dir = tmp_path / "old"
++        new_dir = tmp_path / "moved"
++        old_dir.mkdir()
++        new_dir.mkdir()
++        (old_dir / f"{modname}.py").write_text("VALUE = 'old'\n")
++        (new_dir / f"{modname}.py").write_text("VALUE = 'new'\n")
++
++        user_config = {
++            **DEFAULT_CONFIG,
++            "runtime": {
++                **DEFAULT_CONFIG["runtime"],
++                "auto_reload": "lazy",
++            },
++        }
++        saved_sys_path = sys.path[:]
++        try:
++            with mocked_kernel_session(
++                app_metadata=default_app_metadata(
++                    filename=str(old_dir / "nb.py")
++                ),
++                user_config=user_config,  # type: ignore[arg-type]
++                # Lazy mode keeps the cell from auto-running during rename,
++                # so the evicted sys.modules state is observable.
++                reactive_mode="lazy",
++            ) as tk:
++                k = tk.kernel
++                await k.run(
++                    [
++                        er := exec_req.get(
++                            f"import {modname}\nvalue = {modname}.VALUE"
++                        )
++                    ]
++                )
++                assert k.globals["value"] == "old"
++                assert (
++                    pathlib.Path(sys.modules[modname].__file__).parent
++                    == old_dir
++                )
++
++                reloader = k.autoreload_manager.reloader
++                assert reloader is not None
++
++                await k.rename_file(str(new_dir / "nb.py"))
++
++                # Import resolution now points at the new directory.
++                assert str(old_dir) not in sys.path
++                assert sys.path[0] == str(new_dir)
++                # The old module is evicted and forgotten by autoreload.
++                assert modname not in sys.modules
++                assert modname not in reloader.modules_mtimes
++                assert modname not in reloader.stale_modules
++                # Lazy mode marks the importing cell stale instead of
++                # re-running it during the rename.
++                assert er.cell_id in k.graph.get_stale()
++
++                # A subsequent cell re-imports from the new directory, never
++                # picking up the same-named module left in the old directory.
++                await k.run([er])
++                assert k.globals["value"] == "new"
++                new_module = sys.modules[modname]
++                assert pathlib.Path(new_module.__file__).parent == new_dir
++                # The reloader tracks the new file, not the old one.
++                assert (
++                    reloader.modules_mtimes[modname]
++                    == os.stat(new_module.__file__).st_mtime
++                )
++        finally:
++            sys.modules.pop(modname, None)
++            sys.path[:] = saved_sys_path
++
++    async def test_rename_keeps_vendored_third_party_modules(
++        self, tmp_path: pathlib.Path, exec_req: ExecReqProvider, monkeypatch
++    ) -> None:
++        """A dependency vendored under the notebook dir (e.g. .venv) is not
++        evicted when the notebook moves.
++        """
++        from marimo._runtime.reload import autoreload
++
++        modname = "rename_vendored_dep_module"
++        old_dir = tmp_path / "proj"
++        vendor = old_dir / ".venv" / "lib" / "vendor"
++        new_dir = old_dir / "moved"
++        old_dir.mkdir()
++        vendor.mkdir(parents=True)
++        new_dir.mkdir()
++        (vendor / f"{modname}.py").write_text("VALUE = 1\n")
++
++        vendor_root = os.path.normcase(str(vendor.resolve())) + os.sep
++        monkeypatch.setattr(
++            autoreload,
++            "_non_user_module_roots",
++            lambda: (vendor_root,),
++        )
++
++        saved_sys_path = sys.path[:]
++        try:
++            sys.path.append(str(vendor))
++            with mocked_kernel_session(
++                app_metadata=default_app_metadata(
++                    filename=str(old_dir / "nb.py")
++                ),
++            ) as tk:
++                k = tk.kernel
++                await k.run([exec_req.get(f"import {modname}")])
++                assert modname in sys.modules
++
++                await k.rename_file(str(new_dir / "nb.py"))
++
++                # Third-party module survives; only the notebook-dir entry
++                # moved.
++                assert modname in sys.modules
++                assert str(old_dir) not in sys.path
++                assert sys.path[0] == str(new_dir)
++        finally:
++            sys.modules.pop(modname, None)
++            sys.path[:] = saved_sys_path
++
++    async def test_rename_migrates_default_cache_directory(
++        self, tmp_path: pathlib.Path
++    ) -> None:
++        from marimo._save.stores.file import FileStore
++
++        old_dir = tmp_path / "old"
++        new_dir = tmp_path / "moved"
++        old_dir.mkdir()
++        new_dir.mkdir()
++        saved_sys_path = sys.path[:]
++        try:
++            with mocked_kernel_session(
++                app_metadata=default_app_metadata(
++                    filename=str(old_dir / "nb.py")
++                ),
++            ) as tk:
++                store = tk.ctx.cache.store
++                if not isinstance(store, FileStore):
++                    pytest.skip("default file cache store not configured")
++
++                assert store.put("P_rename.bin", b"payload")
++                old_blob = old_dir / "__marimo__" / "cache" / "P_rename.bin"
++                assert old_blob.exists()
++
++                await tk.kernel.rename_file(str(new_dir / "nb.py"))
++
++                assert not old_blob.exists()
++                new_blob = new_dir / "__marimo__" / "cache" / "P_rename.bin"
++                assert new_blob.exists()
++                assert new_blob.read_bytes() == b"payload"
++                # New writes/reads land at the new path.
++                assert store.hit("P_rename.bin")
++        finally:
++            sys.path[:] = saved_sys_path
++
+     async def test_temporaries_deleted(
+         self, k: Kernel, exec_req: ExecReqProvider
+     ) -> None:
+diff --git a/tests/_server/test_file_manager.py b/tests/_server/test_file_manager.py
+index 3017c2b59..008ca4872 100644
+--- a/tests/_server/test_file_manager.py
++++ b/tests/_server/test_file_manager.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import os
+ import sys
++from pathlib import Path
+ from typing import TYPE_CHECKING
+ 
+ import pytest
+@@ -18,7 +19,6 @@ from marimo._utils.http import HTTPException, HTTPStatus
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Generator
+-    from pathlib import Path
+ 
+ save_request = SaveNotebookRequest(
+     cell_ids=["1"],
+@@ -93,9 +93,78 @@ def test_successful_rename(app_file_manager: AppFileManager) -> None:
+ 
+ def test_rename_exception(app_file_manager: AppFileManager) -> None:
+     new_filename = "/invalid/path/new_filename.py"
++    original = app_file_manager.filename
+     with pytest.raises(HTTPException) as e:
+         app_file_manager.rename(new_filename)
+     assert e.value.status_code == HTTPStatus.SERVER_ERROR
++    # Failed move must leave the pointer and the file where they were.
++    assert app_file_manager.filename == original
++    assert original is not None
++    assert os.path.exists(original)
++
++
++def test_rename_rolls_back_when_save_fails(
++    app_file_manager: AppFileManager, tmp_path: Path
++) -> None:
++    """A write failure after the move must restore the file and pointers."""
++    from marimo._session.notebook.storage import FilesystemStorage
++
++    class FailingWriteStorage(FilesystemStorage):
++        def write(self, path: Path, content: str) -> None:  # type: ignore[override]
++            if Path(path).name == "new_file.py":
++                raise OSError("simulated write failure")
++            super().write(path, content)
++
++    original = Path(app_file_manager.filename)  # type: ignore[arg-type]
++    original_content = original.read_text()
++    app_file_manager.storage = FailingWriteStorage()
++    new_path = tmp_path / "new_file.py"
++
++    with pytest.raises(OSError, match="simulated write failure"):
++        app_file_manager.rename(str(new_path))
++
++    # In-memory pointers restored.
++    assert Path(app_file_manager.filename) == original  # type: ignore[arg-type]
++    assert app_file_manager.app._app._filename == str(original)
++    # File restored at the old path, nothing left at the target.
++    assert original.exists()
++    assert original.read_text() == original_content
++    assert not new_path.exists()
++
++    # The session stays usable: after fixing the problem, the user can
++    # retry the rename.
++    retry_path = tmp_path / "renamed_ok.py"
++    app_file_manager.rename(str(retry_path))
++    assert Path(app_file_manager.filename) == retry_path  # type: ignore[arg-type]
++    assert retry_path.exists()
++
++
++def test_rename_storage_failure_leaves_session_intact(
++    app_file_manager: AppFileManager, tmp_path: Path
++) -> None:
++    """A failure during the storage move must not touch session state."""
++    from marimo._session.notebook.storage import FilesystemStorage
++
++    class FailingRenameStorage(FilesystemStorage):
++        def rename(self, old_path: Path, new_path: Path) -> None:  # type: ignore[override]
++            del old_path, new_path
++            raise PermissionError("simulated permission failure")
++
++    original = Path(app_file_manager.filename)  # type: ignore[arg-type]
++    app_file_manager.storage = FailingRenameStorage()
++    new_path = tmp_path / "new_file.py"
++
++    with pytest.raises(PermissionError):
++        app_file_manager.rename(str(new_path))
++
++    assert Path(app_file_manager.filename) == original  # type: ignore[arg-type]
++    assert original.exists()
++    assert not new_path.exists()
++    # Retry after restoring a working storage backend.
++    app_file_manager.storage = FilesystemStorage()
++    app_file_manager.rename(str(new_path))
++    assert Path(app_file_manager.filename) == new_path  # type: ignore[arg-type]
++    assert new_path.exists()
+ 
+ 
+ def test_rename_create_new_file(app_file_manager: AppFileManager) -> None:
+diff --git a/tests/_session/state/test_serialize_session.py b/tests/_session/state/test_serialize_session.py
+index 8da3a2daa..95e93f286 100644
+--- a/tests/_session/state/test_serialize_session.py
++++ b/tests/_session/state/test_serialize_session.py
+@@ -1003,6 +1003,61 @@ class TestSessionCacheManager:
+             assert manager.session_cache_writer != old_writer
+             assert manager.path == new_path
+ 
++    async def test_rename_path_migrates_cache_file(
++        self, session_view: SessionView
++    ):
++        """The on-disk snapshot moves to the new path so a kernel restart
++        restores the session from the new location."""
++        view = session_view
++        doc = _make_document()
++        with tempfile.TemporaryDirectory() as tmpdir:
++            tmp = Path(tmpdir)
++            old_path = tmp / "old" / "old.py"
++            new_path = tmp / "moved" / "new.py"
++            old_cache = get_session_cache_file(old_path)
++            new_cache = get_session_cache_file(new_path)
++            old_cache.parent.mkdir(parents=True, exist_ok=True)
++            old_cache.write_text('{"version": "1"}')
++
++            manager = SessionCacheManager(view, doc, old_path, 60)
++            manager.start()
++            try:
++                manager.rename_path(new_path)
++                assert manager.path == new_path
++                assert not old_cache.exists()
++                assert new_cache.exists()
++                assert new_cache.read_text() == '{"version": "1"}'
++            finally:
++                manager.stop()
++
++    async def test_rename_path_keeps_old_cache_when_target_exists(
++        self, session_view: SessionView
++    ):
++        """An existing snapshot at the target wins; the orphaned old file is
++        dropped and the writer keeps running at the new path."""
++        view = session_view
++        doc = _make_document()
++        with tempfile.TemporaryDirectory() as tmpdir:
++            tmp = Path(tmpdir)
++            old_path = tmp / "old" / "old.py"
++            new_path = tmp / "moved" / "new.py"
++            old_cache = get_session_cache_file(old_path)
++            new_cache = get_session_cache_file(new_path)
++            old_cache.parent.mkdir(parents=True, exist_ok=True)
++            new_cache.parent.mkdir(parents=True, exist_ok=True)
++            old_cache.write_text("old")
++            new_cache.write_text("new")
++
++            manager = SessionCacheManager(view, doc, old_path, 60)
++            manager.start()
++            try:
++                manager.rename_path(new_path)
++                assert not old_cache.exists()
++                assert new_cache.read_text() == "new"
++                assert manager.session_cache_writer is not None
++            finally:
++                manager.stop()
++
+     def test_read_session_view_no_path(self, session_view: SessionView):
+         """Test reading session view without path"""
+         view = session_view
