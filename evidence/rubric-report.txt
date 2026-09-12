@@ -1,0 +1,10 @@
+marimo-team/marimo｜让连接数据源支持列预览｜复盘结论
+有效轮数：219｜Harness：Trae｜验证：pytest 22 passed；frontend vitest 11 passed
+Rubric ID：1｜状态：不通过｜期望行为：连接或目录数据源保留 database、schema、嵌套路径和列身份并返回当前连接统计｜实际观察：connection 路径构造并返回统计；catalog 路径直接返回不支持｜直接证据：marimo/_runtime/callbacks/datasets.py:158-163；column-preview.tsx:81-92｜原因：catalog 分支直接生成 Column preview for catalog data sources is not supported｜影响：目录数据源点击列不会产生统计结果｜证据位置：marimo/_runtime/callbacks/datasets.py:158-163
+Rubric ID：2｜状态：不通过｜期望行为：使用 EngineCatalog 与 QueryEngine 方言规则获取类型、总数、空值、唯一值并通过通知报告查询错误｜实际观察：connection 使用 EngineCatalog/QueryEngine；catalog 未进入查询路径而直接返回错误通知｜直接证据：marimo/_runtime/callbacks/datasets.py:122-167；tests/_data/test_preview_connection_column.py:602-662｜原因：catalog 数据源未调用 EngineCatalog 或 QueryEngine 统计实现｜影响：目录列无法获得方言统计与查询结果｜证据位置：marimo/_runtime/callbacks/datasets.py:158-163
+Rubric ID：3｜状态：通过｜期望行为：大表、空表、全空列和不支持类型确定降级且查询有界｜实际观察：22 项后端测试覆盖空表、全空列、大表和不支持类型并全部通过；图表查询使用 CHART_MAX_ROWS 上限｜直接证据：tests/_data/test_preview_connection_column.py:367-410,464-512,547-562；marimo/_data/preview_column.py:37,602-607
+Rubric ID：4｜状态：通过｜期望行为：断开或查询失败后可重试且失败不阻塞后续预览｜实际观察：断开与查询失败均广播带 request_id 的错误，前端重新打开错误预览会再次请求｜直接证据：datasets.py:122-153；column-preview.tsx:76-89；test_preview_connection_column.py:602-662
+Rubric ID：5｜状态：通过｜期望行为：快速切换时旧通知不覆盖当前选择｜实际观察：前端按每列最新 request_id 丢弃旧响应，4 项状态测试通过｜直接证据：frontend/src/core/datasets/state.ts:127-139；column-preview-state.test.ts:25-83
+Rubric ID：6｜状态：通过｜期望行为：DuckDB、本地、静态导出和权限限制保持兼容｜实际观察：既有 duckdb/local 分支未改变；前端仅 connection 增加 SQL 图表入口，静态请求客户端保持原行为；相关前端测试 11 项通过｜直接证据：datasets.py:104-121；column-preview.tsx:108-124；vitest 输出 Test Files 2 passed, Tests 11 passed
+收录结论：收录：长程题（有效轮数 219 > 100）｜完成度：部分完成
+Commit：https://github.com/zhanglei10281852-gif/marimo/commit/ccddd563c257ddb1398bedfb56b67003522d3daa
