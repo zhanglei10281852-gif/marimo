@@ -134,11 +134,17 @@ class ListSQLSchemasRequest(ListSQLSchemasCommand, tag=False):
 class PreviewDatasetColumnRequest(PreviewDatasetColumnCommand, tag=False):
     def as_command(self) -> PreviewDatasetColumnCommand:
         return PreviewDatasetColumnCommand(
+            request_id=self.request_id,
             source_type=self.source_type,
             source=self.source,
             table_name=self.table_name,
             column_name=self.column_name,
             fully_qualified_table_name=self.fully_qualified_table_name,
+            engine=self.engine,
+            database=self.database,
+            schema=self.schema,
+            schema_path=self.schema_path,
+            column_type=self.column_type,
         )
 
 

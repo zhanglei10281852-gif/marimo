@@ -56,6 +56,7 @@ describe("code-lens performance", () => {
       expandedTables: new Set<string>(),
       expandedColumns: new Set<QualifiedColumn>(),
       columnsPreviews: new Map(),
+      columnPreviewRequests: new Map(),
     });
     store.set(storageAtom, {
       namespaces: [],

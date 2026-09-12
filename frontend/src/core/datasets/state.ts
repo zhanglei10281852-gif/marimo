@@ -6,9 +6,10 @@ import type {
   DataColumnPreview,
   NotificationMessageData,
 } from "../kernel/messages";
+import { RequestId } from "../network/DeferredRequestRegistry";
 import { getRequestClient } from "../network/requests";
 import type { VariableName } from "../variables/types";
-import type { DatasetsState } from "./types";
+import type { DatasetsState, QualifiedColumn } from "./types";
 
 function initialState(): DatasetsState {
   return {
@@ -16,6 +17,7 @@ function initialState(): DatasetsState {
     expandedTables: new Set(),
     expandedColumns: new Set(),
     columnsPreviews: new Map(),
+    columnPreviewRequests: new Map(),
   };
 }
 
@@ -33,8 +35,13 @@ const {
       for (const column of table.columns) {
         const tableColumn = `${table.name}:${column.name}` as const;
         if (state.expandedColumns.has(tableColumn)) {
+          const requestId = RequestId.create();
+          const columnPreviewRequests = new Map(state.columnPreviewRequests);
+          columnPreviewRequests.set(tableColumn, requestId);
+          state = { ...state, columnPreviewRequests };
           // Fire and forget
           void previewDatasetColumn({
+            requestId,
             tableName: table.name,
             columnName: column.name,
             source: table.source,
@@ -109,8 +116,26 @@ const {
   closeAllColumns: (state) => {
     return { ...state, expandedColumns: new Set() };
   },
+  trackColumnPreviewRequest: (
+    state,
+    opts: { tableColumn: QualifiedColumn; requestId: string },
+  ) => {
+    const columnPreviewRequests = new Map(state.columnPreviewRequests);
+    columnPreviewRequests.set(opts.tableColumn, opts.requestId);
+    return { ...state, columnPreviewRequests };
+  },
   addColumnPreview: (state, preview: DataColumnPreview) => {
     const tableColumn = `${preview.table_name}:${preview.column_name}` as const;
+    // Drop responses for requests that are no longer the latest one, e.g.
+    // when the user quickly switched to another column
+    const latestRequestId = state.columnPreviewRequests.get(tableColumn);
+    if (
+      latestRequestId !== undefined &&
+      preview.request_id !== latestRequestId
+    ) {
+      return state;
+    }
+
     const columnsPreviews = new Map(state.columnsPreviews);
     columnsPreviews.set(tableColumn, preview);
     return { ...state, columnsPreviews };

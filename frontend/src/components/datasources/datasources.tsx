@@ -1082,9 +1082,7 @@ const DatasetColumnItem: React.FC<{
               column={column}
               onAddColumnChart={handleAddColumn}
               preview={columnsPreviews.get(
-                sqlTableContext
-                  ? `${sqlTableContext.database}.${sqlTableContext.schema}.${table.name}:${column.name}`
-                  : `${table.name}:${column.name}`,
+                `${sqlTableContext ? tableUniqueId(sqlTableContext, table.name) : table.name}:${column.name}`,
               )}
               sqlTableContext={sqlTableContext}
             />

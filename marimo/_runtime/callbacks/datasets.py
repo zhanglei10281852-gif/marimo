@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, cast
 from marimo import _loggers
 from marimo._data.data_source_discovery import discover_data_sources
 from marimo._data.preview_column import (
+    get_column_preview_for_connection,
     get_column_preview_for_dataframe,
     get_column_preview_for_duckdb,
 )
@@ -29,7 +30,7 @@ from marimo._runtime.commands import (
     PreviewDatasetColumnCommand,
     PreviewSQLTableCommand,
 )
-from marimo._sql.engines.types import EngineCatalog
+from marimo._sql.engines.types import EngineCatalog, QueryEngine
 from marimo._sql.get_engines import engine_to_data_source_connection
 from marimo._tracer import kernel_tracer
 from marimo._types.ids import VariableName
@@ -96,11 +97,13 @@ class DatasetCallbacks:
             request (PreviewDatasetColumnRequest): The preview request containing:
                 - table_name: Name of the table
                 - column_name: Name of the column
-                - source_type: Type of data source ("duckdb" or "local")
+                - source_type: Type of data source ("duckdb", "local" or
+                  "connection")
         """
         table_name = request.table_name
         column_name = request.column_name
         source_type = request.source_type
+        locator = request.fully_qualified_table_name or table_name
 
         try:
             if source_type == "duckdb":
@@ -115,20 +118,49 @@ class DatasetCallbacks:
                     dataset, request
                 )
             elif source_type == "connection":
-                broadcast_notification(
-                    DataColumnPreviewNotification(
-                        error="Column preview for connection data sources is not supported",
-                        column_name=column_name,
-                        table_name=table_name,
-                    ),
+                engine_name = request.engine or request.source
+                engine, error = self._kernel.get_sql_connection(
+                    cast(VariableName, engine_name)
                 )
-                return
+                if error is not None or engine is None:
+                    reason = error or "engine not found"
+                    broadcast_notification(
+                        DataColumnPreviewNotification(
+                            request_id=request.request_id,
+                            error=(
+                                "Connection is unavailable, reconnect and "
+                                f"try again: {reason}"
+                            ),
+                            column_name=column_name,
+                            table_name=locator,
+                        ),
+                    )
+                    return
+                if not isinstance(engine, QueryEngine):
+                    broadcast_notification(
+                        DataColumnPreviewNotification(
+                            request_id=request.request_id,
+                            error=(
+                                "Statistics and charts are not supported for "
+                                "this connection because it cannot run SQL "
+                                "queries"
+                            ),
+                            column_name=column_name,
+                            table_name=locator,
+                        ),
+                    )
+                    return
+                column_preview = get_column_preview_for_connection(
+                    engine=engine,
+                    request=request,
+                )
             elif source_type == "catalog":
                 broadcast_notification(
                     DataColumnPreviewNotification(
+                        request_id=request.request_id,
                         error="Column preview for catalog data sources is not supported",
                         column_name=column_name,
-                        table_name=table_name,
+                        table_name=locator,
                     ),
                 )
                 return
@@ -138,12 +170,15 @@ class DatasetCallbacks:
             if column_preview is None:
                 broadcast_notification(
                     DataColumnPreviewNotification(
+                        request_id=request.request_id,
                         error=f"Column {column_name} not found",
                         column_name=column_name,
-                        table_name=table_name,
+                        table_name=locator,
                     ),
                 )
             else:
+                if column_preview.request_id is None:
+                    column_preview.request_id = request.request_id
                 broadcast_notification(column_preview)
         except Exception as e:
             LOGGER.warning(
@@ -154,9 +189,10 @@ class DatasetCallbacks:
             )
             broadcast_notification(
                 DataColumnPreviewNotification(
+                    request_id=request.request_id,
                     error=str(e),
                     column_name=column_name,
-                    table_name=table_name,
+                    table_name=locator,
                 ),
             )
         return

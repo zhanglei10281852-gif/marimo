@@ -35,4 +35,7 @@ export interface DatasetsState {
   expandedTables: ReadonlySet<string>;
   expandedColumns: ReadonlySet<QualifiedColumn>;
   columnsPreviews: ColumnPreviewMap;
+  // Latest preview request ID per qualified column, used to discard stale
+  // responses when the user switches columns quickly
+  columnPreviewRequests: ReadonlyMap<QualifiedColumn, string>;
 }

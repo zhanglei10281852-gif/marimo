@@ -94,4 +94,103 @@ describe("DatasetColumnPreview fullyQualifiedTableName", () => {
       }),
     );
   });
+
+  it("requests a preview with connection context for connection tables", () => {
+    const client = renderPreview(
+      ctx({
+        database: "db",
+        schema: "public",
+        engine: "pg_engine",
+        dialect: "postgresql",
+      }),
+    );
+    expect(client.previewDatasetColumn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sourceType: "duckdb",
+        engine: "pg_engine",
+        database: "db",
+        schema: "public",
+        schemaPath: undefined,
+        columnType: undefined,
+        fullyQualifiedTableName: "db.public.users",
+        requestId: expect.any(String),
+      }),
+    );
+  });
+});
+
+describe("DatasetColumnPreview connection sources", () => {
+  const connectionTable: DataTable = {
+    name: "users",
+    columns: [],
+    source: "postgresql",
+    source_type: "connection",
+    type: "table",
+    engine: "pg_engine" as DataTable["engine"],
+    indexes: null,
+    num_columns: null,
+    num_rows: null,
+    variable_name: null,
+    primary_keys: null,
+  };
+
+  const connectionColumn = {
+    name: "email",
+    type: "string",
+  } as DataTableColumn;
+
+  function renderConnection(overrides: Partial<SQLTableContext>) {
+    const client = MockRequestClient.create();
+    store.set(requestClientAtom, client);
+    render(
+      <DatasetColumnPreview
+        table={connectionTable}
+        column={connectionColumn}
+        preview={undefined}
+        onAddColumnChart={vi.fn()}
+        sqlTableContext={{
+          engine: "pg_engine",
+          database: "db",
+          schema: "public",
+          dialect: "postgresql",
+          ...overrides,
+        }}
+      />,
+      { wrapper },
+    );
+    return client;
+  }
+
+  it("fetches the preview on mount using the real table location", () => {
+    const client = renderConnection({});
+    expect(client.previewDatasetColumn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sourceType: "connection",
+        source: "postgresql",
+        engine: "pg_engine",
+        database: "db",
+        schema: "public",
+        tableName: "users",
+        columnName: "email",
+        columnType: "string",
+        fullyQualifiedTableName: "db.public.users",
+        requestId: expect.any(String),
+      }),
+    );
+  });
+
+  it("does not fetch previews for catalogs", () => {
+    const client = MockRequestClient.create();
+    store.set(requestClientAtom, client);
+    render(
+      <DatasetColumnPreview
+        table={{ ...connectionTable, source_type: "catalog" }}
+        column={connectionColumn}
+        preview={undefined}
+        onAddColumnChart={vi.fn()}
+      />,
+      { wrapper },
+    );
+    expect(client.previewDatasetColumn).not.toHaveBeenCalled();
+  });
 });

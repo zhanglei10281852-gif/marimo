@@ -1,7 +1,7 @@
 /* Copyright 2026 Marimo. All rights reserved. */
 
 import { useAtomValue } from "jotai";
-import { PlusSquareIcon } from "lucide-react";
+import { PlusSquareIcon, RefreshCwIcon } from "lucide-react";
 import React, { Suspense } from "react";
 import { useLocale } from "react-aria";
 import { maybeAddAltairImport } from "@/core/cells/add-missing-import";
@@ -9,12 +9,14 @@ import { useCellActions } from "@/core/cells/cells";
 import { useLastFocusedCellId } from "@/core/cells/focus";
 import { autoInstantiateAtom } from "@/core/config/config";
 import type { SQLTableContext } from "@/core/datasets/data-source-connections";
+import { useDatasetsActions } from "@/core/datasets/state";
 import type {
   DataColumnPreview,
   DataTable,
   DataTableColumn,
   DataType,
 } from "@/core/kernel/messages";
+import { RequestId } from "@/core/network/DeferredRequestRegistry";
 import { useRequestClient } from "@/core/network/requests";
 import { useOnMount } from "@/hooks/useLifecycle";
 import type { TopLevelFacetedUnitSpec } from "@/plugins/impl/data-explorer/queries/types";
@@ -40,49 +42,49 @@ export const DatasetColumnPreview: React.FC<{
 }> = ({ table, column, preview, onAddColumnChart, sqlTableContext }) => {
   const { theme } = useTheme();
   const { previewDatasetColumn } = useRequestClient();
+  const { trackColumnPreviewRequest } = useDatasetsActions();
   const { locale } = useLocale();
 
+  const tableKey = sqlTableContext
+    ? tableUniqueId(sqlTableContext, table.name)
+    : table.name;
+
   const previewColumn = () => {
-    previewDatasetColumn({
+    const requestId = RequestId.create();
+    trackColumnPreviewRequest({
+      tableColumn: `${tableKey}:${column.name}`,
+      requestId,
+    });
+    void previewDatasetColumn({
+      requestId,
       source: table.source,
       tableName: table.name,
       columnName: column.name,
       sourceType: table.source_type,
       fullyQualifiedTableName: tableUniqueId(sqlTableContext, table.name),
+      // Connection sources need the exact table location so the backend
+      // queries the right table through the user's own connection
+      engine: sqlTableContext?.engine,
+      database: sqlTableContext?.database,
+      schema: sqlTableContext?.schema,
+      schemaPath: sqlTableContext?.schemaPath,
+      columnType: column.type,
     });
   };
 
   useOnMount(() => {
-    if (preview) {
+    // Retry on reopen so a temporarily disconnected connection can recover
+    if (preview && !preview.error) {
       return;
     }
 
-    // Do not fetch previews for custom SQL connections or catalogs
-    if (table.source_type === "connection" || table.source_type === "catalog") {
+    // Catalogs don't support previews
+    if (table.source_type === "catalog") {
       return;
     }
 
     previewColumn();
   });
-
-  if (table.source_type === "connection") {
-    return (
-      <span className="text-xs text-muted-foreground gap-2 flex items-center justify-between pl-7">
-        {column.name} ({column.external_type})
-        <Button
-          variant="outline"
-          size="xs"
-          onClick={Events.stopPropagation(() => {
-            onAddColumnChart(
-              sqlCode({ table, columnName: column.name, sqlTableContext }),
-            );
-          })}
-        >
-          <PlusSquareIcon className="h-3 w-3 mr-1" /> Add SQL cell
-        </Button>
-      </span>
-    );
-  }
 
   if (table.source_type === "catalog") {
     return (
@@ -115,7 +117,8 @@ export const DatasetColumnPreview: React.FC<{
       <AddDataframeChart chartCode={preview.chart_code} />
     );
 
-  const addSQLChart = table.source_type === "duckdb" && (
+  const addSQLChart = (table.source_type === "duckdb" ||
+    table.source_type === "connection") && (
     <Tooltip content="Add SQL cell" delayDuration={400}>
       <Button
         variant="outline"
@@ -157,15 +160,28 @@ export function renderPreviewError({
   refetchPreview?: () => void;
 }) {
   return (
-    <div className="text-xs text-muted-foreground p-2 border border-border rounded flex items-center justify-between">
+    <div className="text-xs text-muted-foreground p-2 border border-border rounded flex items-center justify-between gap-2">
       <span>{error}</span>
-      {missingPackages && (
+      {missingPackages ? (
         <InstallPackageButton
           packages={missingPackages}
           showMaxPackages={1}
           className="w-32"
           onInstall={refetchPreview}
         />
+      ) : (
+        refetchPreview && (
+          <Tooltip content="Retry" delayDuration={400}>
+            <Button
+              variant="outline"
+              size="icon"
+              className="h-6 w-6 shrink-0"
+              onClick={Events.stopPropagation(refetchPreview)}
+            >
+              <RefreshCwIcon className="h-3 w-3" />
+            </Button>
+          </Tooltip>
+        )
       )}
     </div>
   );

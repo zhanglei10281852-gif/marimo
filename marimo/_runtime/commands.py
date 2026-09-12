@@ -21,7 +21,7 @@ import msgspec
 from marimo import _loggers
 from marimo._ast.app_config import _AppConfig
 from marimo._config.config import MarimoConfig
-from marimo._data.models import DataTableSource
+from marimo._data.models import DataTableSource, DataType
 from marimo._messaging.notebook.document import NotebookCell
 from marimo._messaging.notebook.outputs import CellOutputs
 from marimo._types.encodable import Encodable
@@ -659,11 +659,19 @@ class PreviewDatasetColumnCommand(Command):
     Used by the data explorer UI.
 
     Attributes:
+        request_id: Unique identifier for this request, echoed back in the
+            notification so stale responses can be discarded.
         source_type: Data source type ('dataframe', 'sql', etc.).
         source: Source identifier (connection string or variable name).
         table_name: Table or dataframe variable name.
         column_name: Column to preview.
         fully_qualified_table_name: Full database.schema.table name for SQL.
+        engine: Variable name of the SQL connection, for connection sources.
+        database: Database the table belongs to, for connection sources.
+        schema: Schema the table belongs to, for connection sources.
+        schema_path: Nested schema path (relative to `database`), if any.
+        column_type: Column type inferred from the connection's catalog,
+            used as a fallback when the backend can't introspect it.
     """
 
     # The source type of the dataset
@@ -676,9 +684,22 @@ class PreviewDatasetColumnCommand(Command):
     table_name: str
     # The name of the column
     column_name: str
+    # A unique ID for the request, so the frontend can discard stale
+    # responses when the user quickly switches columns
+    request_id: RequestId | None = None
     # The fully qualified name of the table
     # This is the database.schema.table name
     fully_qualified_table_name: str | None = None
+    # The variable name of the SQL connection, for connection sources
+    engine: str | None = None
+    # The database of the table, for connection sources
+    database: str | None = None
+    # The schema of the table, for connection sources
+    schema: str | None = None
+    # The nested schema path of the table, for connection sources
+    schema_path: list[str] | None = None
+    # The column type from the connection's catalog, used as a fallback
+    column_type: DataType | None = None
 
 
 class PreviewSQLTableCommand(Command):

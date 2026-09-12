@@ -1088,7 +1088,8 @@ components:
       type: object
     DataColumnPreviewNotification:
       description: "Data column preview with stats and visualization.\n\n    Inherits\
-        \ all ColumnPreview attributes.\n\n    Attributes:\n        table_name: Table\
+        \ all ColumnPreview attributes.\n\n    Attributes:\n        request_id: ID\
+        \ of the request this preview responds to, if any.\n        table_name: Table\
         \ containing the column.\n        column_name: Column being previewed."
       properties:
         chart_code:
@@ -1118,6 +1119,11 @@ components:
         op:
           enum:
           - data-column-preview
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
         stats:
           anyOf:
           - type: 'null'
@@ -4363,17 +4369,66 @@ components:
     PreviewDatasetColumnCommand:
       description: "Preview a dataset column.\n\n    Retrieves and displays data from\
         \ a single column (dataframe or SQL table).\n    Used by the data explorer\
-        \ UI.\n\n    Attributes:\n        source_type: Data source type ('dataframe',\
-        \ 'sql', etc.).\n        source: Source identifier (connection string or variable\
-        \ name).\n        table_name: Table or dataframe variable name.\n        column_name:\
-        \ Column to preview.\n        fully_qualified_table_name: Full database.schema.table\
-        \ name for SQL."
+        \ UI.\n\n    Attributes:\n        request_id: Unique identifier for this request,\
+        \ echoed back in the\n            notification so stale responses can be discarded.\n\
+        \        source_type: Data source type ('dataframe', 'sql', etc.).\n     \
+        \   source: Source identifier (connection string or variable name).\n    \
+        \    table_name: Table or dataframe variable name.\n        column_name: Column\
+        \ to preview.\n        fully_qualified_table_name: Full database.schema.table\
+        \ name for SQL.\n        engine: Variable name of the SQL connection, for\
+        \ connection sources.\n        database: Database the table belongs to, for\
+        \ connection sources.\n        schema: Schema the table belongs to, for connection\
+        \ sources.\n        schema_path: Nested schema path (relative to `database`),\
+        \ if any.\n        column_type: Column type inferred from the connection's\
+        \ catalog,\n            used as a fallback when the backend can't introspect\
+        \ it."
       properties:
         columnName:
           type: string
+        columnType:
+          anyOf:
+          - enum:
+            - boolean
+            - date
+            - datetime
+            - geometry
+            - integer
+            - number
+            - string
+            - time
+            - unknown
+          - type: 'null'
+          default: null
+        database:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+        engine:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
         fullyQualifiedTableName:
           anyOf:
           - type: string
+          - type: 'null'
+          default: null
+        requestId:
+          anyOf:
+          - $ref: '#/components/schemas/RequestId'
+          - type: 'null'
+          default: null
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+        schemaPath:
+          anyOf:
+          - items:
+              type: string
+            type: array
           - type: 'null'
           default: null
         source:
@@ -4401,9 +4456,50 @@ components:
       properties:
         columnName:
           type: string
+        columnType:
+          anyOf:
+          - enum:
+            - boolean
+            - date
+            - datetime
+            - geometry
+            - integer
+            - number
+            - string
+            - time
+            - unknown
+          - type: 'null'
+          default: null
+        database:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+        engine:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
         fullyQualifiedTableName:
           anyOf:
           - type: string
+          - type: 'null'
+          default: null
+        requestId:
+          anyOf:
+          - $ref: '#/components/schemas/RequestId'
+          - type: 'null'
+          default: null
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+        schemaPath:
+          anyOf:
+          - items:
+              type: string
+            type: array
           - type: 'null'
           default: null
         source:

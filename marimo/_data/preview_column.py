@@ -7,7 +7,7 @@ import narwhals.stable.v2 as nw
 
 from marimo import _loggers
 from marimo._data.charts import ChartBuilder, get_chart_builder
-from marimo._data.models import ColumnStats
+from marimo._data.models import ColumnStats, DataType
 from marimo._data.sql_summaries import (
     get_column_type,
     get_sql_stats,
@@ -23,8 +23,14 @@ from marimo._plugins.ui._impl.tables.table_manager import (
 )
 from marimo._plugins.ui._impl.tables.utils import get_table_manager_or_none
 from marimo._runtime.commands import PreviewDatasetColumnCommand
+from marimo._sql.engines.types import EngineCatalog, QueryEngine
+from marimo._sql.sql_quoting import quote_qualified_name, quote_sql_identifier
 from marimo._sql.utils import wrapped_sql
-from marimo._utils.narwhals_utils import downgrade_narwhals_df_to_v1
+from marimo._utils.narwhals_utils import (
+    downgrade_narwhals_df_to_v1,
+    is_narwhals_string_type,
+    is_narwhals_time_type,
+)
 
 LOGGER = _loggers.marimo_logger()
 
@@ -212,6 +218,445 @@ def get_column_preview_for_duckdb(
         error=error,
         missing_packages=missing_packages,
     )
+
+
+def get_column_preview_for_connection(
+    *,
+    engine: QueryEngine[Any],
+    request: PreviewDatasetColumnCommand,
+) -> DataColumnPreviewNotification:
+    """Get a column preview for a table reached through a user SQL connection.
+
+    Stats are computed with aggregate queries on the connection itself, and
+    chart data is pulled with a hard row cap so whole columns are never
+    fetched.
+    """
+    column_name = request.column_name
+    database = request.database or ""
+    schema = request.schema or ""
+    schema_path = request.schema_path or None
+    table_name = request.table_name
+    locator = request.fully_qualified_table_name or table_name
+    dialect = engine.dialect.lower()
+
+    qualified_table = _qualify_connection_table_name(
+        engine,
+        database=database,
+        schema=schema,
+        schema_path=schema_path,
+        table_name=table_name,
+    )
+    quoted_column = quote_sql_identifier(column_name, dialect=dialect)
+
+    column_type = _resolve_connection_column_type(
+        engine,
+        database=database,
+        schema=schema,
+        schema_path=schema_path,
+        table_name=table_name,
+        qualified_table=qualified_table,
+        column_name=column_name,
+        fallback_type=request.column_type,
+    )
+
+    def _notify(
+        *,
+        stats: ColumnStats | None = None,
+        chart_spec: str | None = None,
+        error: str | None = None,
+        missing_packages: list[str] | None = None,
+    ) -> DataColumnPreviewNotification:
+        return DataColumnPreviewNotification(
+            request_id=request.request_id,
+            table_name=locator,
+            column_name=column_name,
+            chart_spec=chart_spec,
+            chart_code=None,
+            stats=stats,
+            error=error,
+            missing_packages=missing_packages,
+        )
+
+    if column_type is None:
+        return _notify(
+            error=f"Unable to determine the type of column {column_name}",
+        )
+
+    # Aggregates run in the database; this never pulls the column itself.
+    stats = _get_connection_sql_stats(
+        engine,
+        qualified_table=qualified_table,
+        quoted_column=quoted_column,
+        column_type=column_type,
+    )
+
+    chart_spec, error, missing_packages = _get_connection_chart(
+        engine,
+        qualified_table=qualified_table,
+        column_name=column_name,
+        column_type=column_type,
+        total=stats.total,
+        nulls=stats.nulls,
+    )
+
+    return _notify(
+        stats=stats,
+        chart_spec=chart_spec,
+        error=error,
+        missing_packages=missing_packages,
+    )
+
+
+def _qualify_connection_table_name(
+    engine: QueryEngine[Any],
+    *,
+    database: str,
+    schema: str,
+    schema_path: list[str] | None,
+    table_name: str,
+) -> str:
+    """Build a dialect-quoted, fully qualified table name for a connection."""
+    dialect = engine.dialect.lower()
+
+    if schema_path:
+        namespace_parts = [*schema_path]
+    else:
+        namespace_parts = [schema] if schema else []
+
+    parts: list[str] = []
+    if database:
+        default_database: str | None = None
+        if isinstance(engine, EngineCatalog):
+            try:
+                default_database = engine.get_default_database()
+            except Exception:
+                LOGGER.debug(
+                    "Failed to get default database for %s engine",
+                    dialect,
+                    exc_info=True,
+                )
+        # Omit the catalog when it is the connection's current one: some
+        # dialects (e.g. Postgres) reject 3-part names for it.
+        if database != default_database:
+            parts.append(database)
+
+    parts.extend(part for part in namespace_parts if part)
+    parts.append(table_name)
+    # Snowflake/StarRocks normalize unquoted identifiers in their catalog, so
+    # use the engine's own quoting rules for those dialects.
+    if dialect in ("snowflake", "starrocks"):
+        engine_quote = getattr(engine, "_quote_identifier", None)
+        if callable(engine_quote):
+            return ".".join(engine_quote(part) for part in parts)
+    return quote_qualified_name(*parts, dialect=dialect)
+
+
+def _resolve_connection_column_type(
+    engine: QueryEngine[Any],
+    *,
+    database: str,
+    schema: str,
+    schema_path: list[str] | None,
+    table_name: str,
+    qualified_table: str,
+    column_name: str,
+    fallback_type: DataType | None,
+) -> DataType | None:
+    """Determine the column type using the connection, then the UI hint."""
+    if isinstance(engine, EngineCatalog):
+        try:
+            details = engine.get_table_details(
+                table_name=table_name,
+                schema_name=schema,
+                database_name=database,
+                schema_path=schema_path,
+            )
+        except Exception:
+            LOGGER.debug(
+                "Catalog failed to resolve column %s",
+                column_name,
+                exc_info=True,
+            )
+            details = None
+        if details is not None:
+            for column in details.columns:
+                if column.name == column_name:
+                    return column.type
+
+    inferred = _infer_connection_column_type(
+        engine, qualified_table, column_name
+    )
+    if inferred is not None:
+        return inferred
+
+    return fallback_type
+
+
+def _infer_connection_column_type(
+    engine: QueryEngine[Any], qualified_table: str, column_name: str
+) -> DataType | None:
+    """Infer the type from a zero-row SELECT's result schema."""
+    dialect = engine.dialect.lower()
+    quoted_column = quote_sql_identifier(column_name, dialect=dialect)
+    query = _bounded_select_query(
+        dialect,
+        f"SELECT {quoted_column} FROM {qualified_table}",
+        0,
+    )
+    try:
+        result = engine.execute(query)
+        frame = nw.from_native(result, pass_through=True)
+        if isinstance(frame, nw.LazyFrame):
+            frame = frame.collect()
+        dtype = frame.collect_schema()[column_name]
+    except Exception:
+        LOGGER.debug(
+            "Failed to infer type of column %s", column_name, exc_info=True
+        )
+        return None
+
+    if is_narwhals_string_type(dtype):
+        return "string"
+    if dtype == nw.Boolean:
+        return "boolean"
+    if dtype == nw.Duration:
+        return "number"
+    if dtype.is_integer():
+        return "integer"
+    if is_narwhals_time_type(dtype):
+        return "time"
+    if dtype == nw.Date:
+        return "date"
+    if dtype == nw.Datetime or dtype.is_temporal():
+        return "datetime"
+    if dtype.is_numeric():
+        return "number"
+    return "unknown"
+
+
+def _execute_first_row(
+    engine: QueryEngine[Any], query: str
+) -> tuple[Any, ...] | None:
+    """Execute a query and return its first row as a plain tuple."""
+    result = engine.execute(query)
+    if result is None:
+        return None
+
+    try:
+        frame = nw.from_native(result, pass_through=True)
+        if isinstance(frame, nw.LazyFrame):
+            frame = frame.collect()
+        if frame.shape[0] == 0:
+            return None
+        return tuple(frame.row(0))
+    except Exception:
+        pass
+
+    fetchone = getattr(result, "fetchone", None)
+    if callable(fetchone):
+        row = fetchone()
+        return tuple(row) if row is not None else None
+    return None
+
+
+def _as_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(value)
+
+
+def _get_connection_sql_stats(
+    engine: QueryEngine[Any],
+    *,
+    qualified_table: str,
+    quoted_column: str,
+    column_type: DataType,
+) -> ColumnStats:
+    """Run portable aggregate queries against the connection."""
+    base_query = f"""
+    SELECT
+        COUNT(*) as col_count,
+        COUNT(DISTINCT {quoted_column}) as col_unique,
+        SUM(CASE WHEN {quoted_column} IS NULL THEN 1 ELSE 0 END) as col_nulls
+    FROM {qualified_table}
+    """
+    base_row = _execute_first_row(engine, base_query)
+    if base_row is None:
+        raise ValueError("Failed to compute column statistics")
+
+    total, unique, null_count = base_row
+    stats = ColumnStats(
+        total=_as_int(total),
+        unique=_as_int(unique),
+        nulls=_as_int(null_count),
+    )
+
+    if stats.total == 0:
+        return stats
+
+    if column_type in ("integer", "number"):
+        row = _best_effort_row(
+            engine,
+            f"""
+            SELECT
+                MIN({quoted_column}) as col_min,
+                MAX({quoted_column}) as col_max,
+                AVG({quoted_column}) as col_mean
+            FROM {qualified_table}
+            """,
+        )
+        if row is not None:
+            stats.min, stats.max, stats.mean = (
+                row[0],
+                row[1],
+                row[2],
+            )
+    elif column_type in ("date", "datetime", "time"):
+        row = _best_effort_row(
+            engine,
+            f"""
+            SELECT
+                MIN({quoted_column}) as col_min,
+                MAX({quoted_column}) as col_max
+            FROM {qualified_table}
+            """,
+        )
+        if row is not None:
+            stats.min, stats.max = row[0], row[1]
+    elif column_type == "boolean":
+        true_expr, false_expr = _boolean_count_expressions(
+            quoted_column, engine.dialect.lower()
+        )
+        row = _best_effort_row(
+            engine,
+            f"""
+            SELECT {true_expr} as col_true, {false_expr} as col_false
+            FROM {qualified_table}
+            """,
+        )
+        if row is not None:
+            stats.true = _as_int(row[0])
+            stats.false = _as_int(row[1])
+
+    return stats
+
+
+def _best_effort_row(
+    engine: QueryEngine[Any], query: str
+) -> tuple[Any, ...] | None:
+    """Run an optional stats query, degrading silently if the dialect rejects it."""
+    try:
+        return _execute_first_row(engine, query)
+    except Exception:
+        LOGGER.warning(
+            "Optional statistics query failed for %s engine",
+            engine.dialect,
+            exc_info=True,
+        )
+        return None
+
+
+def _boolean_count_expressions(
+    quoted_column: str, dialect: str
+) -> tuple[str, str]:
+    # T-SQL bit columns can't be used as bare boolean expressions
+    if dialect in ("mssql", "sqlserver"):
+        return (
+            f"SUM(CASE WHEN {quoted_column} = 1 THEN 1 ELSE 0 END)",
+            f"SUM(CASE WHEN {quoted_column} = 0 THEN 1 ELSE 0 END)",
+        )
+    return (
+        f"SUM(CASE WHEN {quoted_column} = TRUE THEN 1 ELSE 0 END)",
+        f"SUM(CASE WHEN {quoted_column} = FALSE THEN 1 ELSE 0 END)",
+    )
+
+
+def _bounded_select_query(dialect: str, select_query: str, limit: int) -> str:
+    """Render a row-limited SELECT for engines without standard LIMIT."""
+    dialect = dialect.lower()
+    if dialect in ("mssql", "sqlserver"):
+        return select_query.replace("SELECT ", f"SELECT TOP {limit} ", 1)
+    if dialect in ("oracle", "oracledb", "db2", "db2i"):
+        return f"{select_query} FETCH FIRST {limit} ROWS ONLY"
+    return f"{select_query} LIMIT {limit}"
+
+
+def _get_connection_chart(
+    engine: QueryEngine[Any],
+    *,
+    qualified_table: str,
+    column_name: str,
+    column_type: DataType,
+    total: int | None,
+    nulls: int | None,
+) -> tuple[str | None, str | None, list[str] | None]:
+    """Build the Altair chart from a bounded sample read through the connection.
+
+    Returns chart_spec, error, missing_packages.
+    """
+    # Geometry/unknown columns can't be charted
+    if column_type in ("unknown", "geometry"):
+        return None, None, None
+
+    if total is None or total == 0:
+        return None, "Table is empty", None
+
+    if nulls is not None and nulls == total:
+        return None, "Column contains only null values", None
+
+    if total > CHART_MAX_ROWS:
+        return None, VEGAFUSION_ERROR, VEGAFUSION_MISSING_PACKAGES
+
+    if not DependencyManager.altair.has():
+        return None, ALTAIR_ERROR, ALTAIR_MISSING_PACKAGES
+
+    # Same identifier restrictions as local and DuckDB previews
+    for char in ["\\", '"', "'"]:
+        if char in str(column_name):
+            return (
+                None,
+                (
+                    f"Column names with `{char}` are not supported in charts. "
+                    "Consider renaming the column."
+                ),
+                None,
+            )
+
+    dialect = engine.dialect.lower()
+    quoted_column = quote_sql_identifier(column_name, dialect=dialect)
+    query = _bounded_select_query(
+        dialect,
+        f"SELECT {quoted_column} FROM {qualified_table}",
+        CHART_MAX_ROWS,
+    )
+
+    try:
+        result = engine.execute(query)
+        column_data = nw.from_native(result, pass_through=True)
+        if isinstance(column_data, nw.LazyFrame):
+            column_data = column_data.collect()
+        if column_data.shape[0] == 0:
+            return None, "Table is empty", None
+        column_data = _sanitize_data(column_data, column_name)
+        if isinstance(column_data, nw.LazyFrame):
+            column_data = column_data.collect()
+        chart_spec = _get_chart_spec(
+            column_data=downgrade_narwhals_df_to_v1(column_data),
+            column_type=column_type,
+            column_name=column_name,
+            chart_builder=get_chart_builder(
+                column_type, should_limit_to_10_items=True
+            ),
+        )
+        return chart_spec, None, None
+    except Exception as e:
+        LOGGER.warning(
+            "Failed to generate chart for column %s via %s connection",
+            column_name,
+            dialect,
+            exc_info=e,
+        )
+        return None, None, None
 
 
 def _get_altair_chart(

@@ -4381,6 +4381,7 @@ export interface components {
      *         Inherits all ColumnPreview attributes.
      *
      *         Attributes:
+     *             request_id: ID of the request this preview responds to, if any.
      *             table_name: Table containing the column.
      *             column_name: Column being previewed.
      */
@@ -4396,6 +4397,8 @@ export interface components {
       missing_packages?: string[] | null;
       /** @enum {unknown} */
       op: "data-column-preview";
+      /** @default null */
+      request_id?: string | null;
       /** @default null */
       stats?: null | components["schemas"]["ColumnStats"];
       table_name: string;
@@ -6338,16 +6341,48 @@ export interface components {
      *         Used by the data explorer UI.
      *
      *         Attributes:
+     *             request_id: Unique identifier for this request, echoed back in the
+     *                 notification so stale responses can be discarded.
      *             source_type: Data source type ('dataframe', 'sql', etc.).
      *             source: Source identifier (connection string or variable name).
      *             table_name: Table or dataframe variable name.
      *             column_name: Column to preview.
      *             fully_qualified_table_name: Full database.schema.table name for SQL.
+     *             engine: Variable name of the SQL connection, for connection sources.
+     *             database: Database the table belongs to, for connection sources.
+     *             schema: Schema the table belongs to, for connection sources.
+     *             schema_path: Nested schema path (relative to `database`), if any.
+     *             column_type: Column type inferred from the connection's catalog,
+     *                 used as a fallback when the backend can't introspect it.
      */
     PreviewDatasetColumnCommand: {
       columnName: string;
       /** @default null */
+      columnType?:
+        | (
+            | "boolean"
+            | "date"
+            | "datetime"
+            | "geometry"
+            | "integer"
+            | "number"
+            | "string"
+            | "time"
+            | "unknown"
+          )
+        | null;
+      /** @default null */
+      database?: string | null;
+      /** @default null */
+      engine?: string | null;
+      /** @default null */
       fullyQualifiedTableName?: string | null;
+      /** @default null */
+      requestId?: components["schemas"]["RequestId"] | null;
+      /** @default null */
+      schema?: string | null;
+      /** @default null */
+      schemaPath?: string[] | null;
       source: string;
       /** @enum {unknown} */
       sourceType: "catalog" | "connection" | "duckdb" | "local";
@@ -6359,7 +6394,31 @@ export interface components {
     PreviewDatasetColumnRequest: {
       columnName: string;
       /** @default null */
+      columnType?:
+        | (
+            | "boolean"
+            | "date"
+            | "datetime"
+            | "geometry"
+            | "integer"
+            | "number"
+            | "string"
+            | "time"
+            | "unknown"
+          )
+        | null;
+      /** @default null */
+      database?: string | null;
+      /** @default null */
+      engine?: string | null;
+      /** @default null */
       fullyQualifiedTableName?: string | null;
+      /** @default null */
+      requestId?: components["schemas"]["RequestId"] | null;
+      /** @default null */
+      schema?: string | null;
+      /** @default null */
+      schemaPath?: string[] | null;
       source: string;
       /** @enum {unknown} */
       sourceType: "catalog" | "connection" | "duckdb" | "local";

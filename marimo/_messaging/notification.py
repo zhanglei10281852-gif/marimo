@@ -739,11 +739,13 @@ class DataColumnPreviewNotification(
     Inherits all ColumnPreview attributes.
 
     Attributes:
+        request_id: ID of the request this preview responds to, if any.
         table_name: Table containing the column.
         column_name: Column being previewed.
     """
 
     name: ClassVar[str] = "data-column-preview"
+    request_id: str | None = None
     table_name: str
     column_name: str
 
