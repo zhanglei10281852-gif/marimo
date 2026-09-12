@@ -1,0 +1,896 @@
+﻿diff --git a/marimo/_export/exporter.py b/marimo/_export/exporter.py
+index 6a9a9e55d..4c0842623 100644
+--- a/marimo/_export/exporter.py
++++ b/marimo/_export/exporter.py
+@@ -3,8 +3,12 @@ from __future__ import annotations
+ 
+ import asyncio
+ import base64
++import contextlib
++import os
+ import sys
++import threading
+ from concurrent.futures import ThreadPoolExecutor
++from dataclasses import dataclass, field
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Any, Literal, cast
+ 
+@@ -876,7 +880,33 @@ async def render_pdf(request: PDFExportRequest) -> bytes | None:
+ AutoExportFormat = Literal["html", "md", "ipynb"]
+ 
+ 
++@dataclass
++class _ExportSlot:
++    """Revision state for a single export output path.
++
++    The lock is a threading lock because the revision check and the
++    atomic file publish run partly in worker threads and must not
++    interleave.
++    """
++
++    revision: int = 0
++    lock: threading.Lock = field(default_factory=threading.Lock)
++
++
+ class AutoExporter:
++    """Publishes auto-exported files with per-output-path revisioning.
++
++    Each save carries a revision from `reserve_revision`. A save is only
++    published when its revision is still current, so a slow older export
++    can never overwrite a newer notebook version. Output paths include
++    the format, so different formats have independent slots and never
++    cancel each other.
++
++    Writes are atomic (same-directory temp file + `os.replace`): a
++    reader sees either the previous complete file or the new one, never
++    a partially written artifact.
++    """
++
+     def __init__(self) -> None:
+         # Cache directories we've already created to avoid redundant checks
+         self._created_dirs: set[Path] = set()
+@@ -884,8 +914,11 @@ class AutoExporter:
+         self._executor = ThreadPoolExecutor(
+             max_workers=4, thread_name_prefix="export"
+         )
+-        self._latest_revisions: dict[Path, int] = {}
+-        self._file_locks: dict[Path, asyncio.Lock] = {}
++        self._slots: dict[Path, _ExportSlot] = {}
++        self._temp_counter = 0
++        # Bumped on cleanup(); a save in flight across a cleanup can never
++        # commit into the new (shutting down / reopened) epoch.
++        self._epoch = 0
+ 
+     @staticmethod
+     def _export_path(
+@@ -895,13 +928,31 @@ class AutoExporter:
+         download_name = get_download_filename(filename, extension)
+         return notebook_output_dir(notebook_path) / download_name
+ 
++    def _slot_for(self, filepath: Path) -> _ExportSlot:
++        slot = self._slots.get(filepath)
++        if slot is None:
++            slot = _ExportSlot()
++            self._slots[filepath] = slot
++        return slot
++
+     def reserve_revision(
+         self, filename: str | None, extension: AutoExportFormat
+     ) -> int:
+         filepath = self._export_path(filename, extension)
+-        revision = self._latest_revisions.get(filepath, 0) + 1
+-        self._latest_revisions[filepath] = revision
+-        return revision
++        slot = self._slot_for(filepath)
++        with slot.lock:
++            slot.revision += 1
++            return slot.revision
++
++    async def save(
++        self,
++        filename: str | None,
++        content: str,
++        *,
++        extension: AutoExportFormat,
++        revision: int,
++    ) -> bool:
++        return await self._save_file(filename, content, extension, revision)
+ 
+     async def _save_file(
+         self,
+@@ -910,18 +961,58 @@ class AutoExporter:
+         extension: AutoExportFormat,
+         revision: int,
+     ) -> bool:
++        # An empty export is never a fully-written artifact, so keep the
++        # pending state and let the next save retry.
++        if not content:
++            return False
++
+         filepath = self._export_path(filename, extension)
+-        lock = self._file_locks.setdefault(filepath, asyncio.Lock())
+-        async with lock:
+-            if revision != self._latest_revisions.get(filepath):
++        slot = self._slot_for(filepath)
++
++        # Fast path: don't stage bytes for a revision that is already stale.
++        with slot.lock:
++            if slot.revision != revision:
+                 return False
+ 
+-            await self._ensure_export_dir_async(filepath.parent)
++        await self._ensure_export_dir_async(filepath.parent)
++        tmp_path = self._create_temp_path(filepath)
++        epoch = self._epoch
++        committed = False
++        try:
+             loop = asyncio.get_running_loop()
+             await loop.run_in_executor(
+-                self._executor, self._write_file_sync, filepath, content
++                self._executor, self._stage_file_sync, tmp_path, content
++            )
++            # The commit re-checks the revision under the slot lock right
++            # before os.replace, so a revision reserved while staging can't
++            # be overwritten by the older bytes.
++            committed = await loop.run_in_executor(
++                self._executor,
++                self._commit_file_sync,
++                tmp_path,
++                filepath,
++                slot,
++                revision,
++                epoch,
+             )
+-            return revision == self._latest_revisions.get(filepath)
++            return committed
++        except (RuntimeError, OSError):
++            # RuntimeError: the executor was shut down (server stopping).
++            # OSError: staging failed. Leave the pending state untouched so
++            # the next save or dependency recovery retries the export.
++            LOGGER.warning(
++                "Failed to auto-export %s; it will be retried on next save",
++                filepath,
++                exc_info=True,
++            )
++            return False
++        finally:
++            if not committed:
++                # On shutdown the staging thread may still hold the file
++                # open (notably on Windows); a leaked temp file is never
++                # published, so just leave it for the OS to clean up.
++                with contextlib.suppress(OSError):
++                    tmp_path.unlink()
+ 
+     async def save_html(
+         self, filename: str | None, html: str, *, revision: int
+@@ -938,11 +1029,33 @@ class AutoExporter:
+     ) -> bool:
+         return await self._save_file(filename, ipynb, "ipynb", revision)
+ 
+-    def _write_file_sync(self, filepath: Path, content: str) -> None:
+-        """Synchronous file write (runs in thread pool)"""
+-        if content == "":
+-            return
+-        filepath.write_text(content, encoding="utf-8")
++    def _create_temp_path(self, filepath: Path) -> Path:
++        # Unique within the process; same directory as the target so the
++        # final os.replace is atomic on every platform.
++        self._temp_counter += 1
++        name = f".{filepath.name}.{os.getpid()}.{self._temp_counter}.tmp"
++        return filepath.parent / name
++
++    @staticmethod
++    def _stage_file_sync(tmp_path: Path, content: str) -> None:
++        with open(tmp_path, "w", encoding="utf-8") as f:
++            f.write(content)
++            f.flush()
++            os.fsync(f.fileno())
++
++    def _commit_file_sync(
++        self,
++        tmp_path: Path,
++        filepath: Path,
++        slot: _ExportSlot,
++        revision: int,
++        epoch: int,
++    ) -> bool:
++        with slot.lock:
++            if self._epoch != epoch or slot.revision != revision:
++                return False
++            os.replace(tmp_path, filepath)
++            return True
+ 
+     async def _ensure_export_dir_async(self, export_dir: Path) -> None:
+         """Async directory creation with caching to avoid redundant checks"""
+@@ -956,10 +1069,22 @@ class AutoExporter:
+         self._created_dirs.add(export_dir)
+ 
+     def cleanup(self) -> None:
+-        """Cleanup resources"""
+-        self._executor.shutdown(wait=False)
+-        self._latest_revisions.clear()
+-        self._file_locks.clear()
++        """Discard unfinished export work and reset to a fresh state.
++
++        Queued writes are cancelled and all pending revisions are dropped,
++        so a save in flight fails its revision check instead of publishing
++        into a shutting-down server; a write that already reached the
++        atomic replace finishes as a complete file. New exports afterwards
++        start from a clean slate (a reopened notebook regenerates its
++        files).
++        """
++        self._executor.shutdown(wait=False, cancel_futures=True)
++        self._executor = ThreadPoolExecutor(
++            max_workers=4, thread_name_prefix="export"
++        )
++        self._slots.clear()
++        self._created_dirs.clear()
++        self._epoch += 1
+ 
+ 
+ def get_html_contents() -> str:
+diff --git a/marimo/_server/api/endpoints/export.py b/marimo/_server/api/endpoints/export.py
+index 0aef87b52..0067a42b3 100644
+--- a/marimo/_server/api/endpoints/export.py
++++ b/marimo/_server/api/endpoints/export.py
+@@ -1,6 +1,7 @@
+ # Copyright 2026 Marimo. All rights reserved.
+ from __future__ import annotations
+ 
++import asyncio
+ from dataclasses import replace
+ from typing import TYPE_CHECKING
+ 
+@@ -28,6 +29,7 @@ from marimo._export.dependencies import (
+ )
+ from marimo._export.exporter import (
+     AutoExporter,
++    AutoExportFormat,
+     Exporter,
+     export_markdown,
+     export_script,
+@@ -74,11 +76,16 @@ from marimo._server.api.utils import (
+ )
+ from marimo._server.models.models import SuccessResponse
+ from marimo._server.router import APIRouter
++from marimo._session.model import ConnectionState
+ from marimo._utils.http import HTTPStatus
+ 
+ if TYPE_CHECKING:
++    from collections.abc import Callable
++
+     from starlette.requests import Request
+ 
++    from marimo._session.session import Session
++
+ LOGGER = _loggers.marimo_logger()
+ 
+ # Router for export endpoints
+@@ -87,6 +94,65 @@ router = APIRouter()
+ auto_exporter = AutoExporter()
+ 
+ 
++def _auto_export_still_current(session: Session, filename: str) -> bool:
++    """Whether an export captured for `filename` may still be published.
++
++    A session close/server shutdown or a notebook rename both invalidate
++    any in-flight export, regardless of its revision.
++    """
++    if session.connection_state() is ConnectionState.CLOSED:
++        return False
++    return session.app_file_manager.filename == filename
++
++
++async def _run_auto_export(
++    *,
++    session: Session,
++    filename: str,
++    extension: AutoExportFormat,
++    revision: int,
++    produce: Callable[[], str],
++    mark_exported: Callable[[], bool],
++) -> None:
++    """Produce and publish one auto-export file in the background.
++
++    The exported state is only marked once the bytes for the matching
++    revision have been atomically written to the matching output path.
++    Stale revisions, renames, closed sessions, and producer failures leave
++    the pending state untouched, so the next poll or save retries.
++    """
++    try:
++        if not _auto_export_still_current(session, filename):
++            return
++
++        content = produce()
++
++        # Producing the export is blocking; the notebook may have been
++        # renamed or the session closed while it ran.
++        if not _auto_export_still_current(session, filename):
++            return
++
++        committed = await auto_exporter.save(
++            filename=filename,
++            content=content,
++            extension=extension,
++            revision=revision,
++        )
++        if committed and _auto_export_still_current(session, filename):
++            mark_exported()
++    except asyncio.CancelledError:
++        raise
++    except Exception:
++        # Keep the pending state so dependency recovery or the next save
++        # retries; an older failed task must not mark anything exported.
++        LOGGER.warning(
++            "Auto-export of %s for %s failed; it will be retried on next save",
++            extension,
++            filename,
++            exc_info=True,
++        )
++
++
+ async def _get_export_format_availability(
+     export_format: ServerExportFormat,
+ ) -> ExportFormatAvailability:
+@@ -324,10 +390,11 @@ async def auto_export_as_html(
+         return PlainTextResponse(status_code=HTTPStatus.NOT_MODIFIED)
+ 
+     filename = session.app_file_manager.filename
++    assert filename is not None  # guaranteed by is_notebook_named above
+     generation = session_view.auto_export_generation
+     revision = auto_exporter.reserve_revision(filename, "html")
+ 
+-    async def _background_export() -> None:
++    def _produce_html() -> str:
+         app = session.app_file_manager.app
+         html, _filename = Exporter().export_as_html(
+             HTMLExportRequest(
+@@ -345,21 +412,21 @@ async def auto_export_as_html(
+                 layout=layout,
+             )
+         )
+-
+-        # Save the HTML file to disk, at `.marimo/<filename>.html`
+-        if session.app_file_manager.filename != filename:
+-            return
+-        committed = await auto_exporter.save_html(
+-            filename=filename,
+-            html=html,
+-            revision=revision,
+-        )
+-        if committed:
+-            session_view.mark_auto_export_html(layout, generation=generation)
++        return html
+ 
+     return JSONResponse(
+         content=asdict(SuccessResponse()),
+-        background=BackgroundTask(_background_export),
++        background=BackgroundTask(
++            _run_auto_export,
++            session=session,
++            filename=filename,
++            extension="html",
++            revision=revision,
++            produce=_produce_html,
++            mark_exported=lambda: session_view.mark_auto_export_html(
++                layout, generation=generation
++            ),
++        ),
+     )
+ 
+ 
+@@ -581,10 +648,11 @@ async def auto_export_as_markdown(
+         return PlainTextResponse(status_code=HTTPStatus.NOT_MODIFIED)
+ 
+     filename = session.app_file_manager.filename
++    assert filename is not None  # guaranteed by is_notebook_named above
+     generation = session_view.auto_export_generation
+     revision = auto_exporter.reserve_revision(filename, "md")
+ 
+-    async def _background_export() -> None:
++    def _produce_markdown() -> str:
+         # Reload the file manager to get the latest state
+         session.app_file_manager.reload()
+ 
+@@ -594,21 +662,21 @@ async def auto_export_as_markdown(
+                 options=MarkdownExportOptions(),
+             )
+         )
+-
+-        # Save the Markdown file to disk, at `.marimo/<filename>.md`
+-        if session.app_file_manager.filename != filename:
+-            return
+-        committed = await auto_exporter.save_md(
+-            filename=filename,
+-            markdown=result.text,
+-            revision=revision,
+-        )
+-        if committed:
+-            session_view.mark_auto_export_md(generation=generation)
++        return result.text
+ 
+     return JSONResponse(
+         content=asdict(SuccessResponse()),
+-        background=BackgroundTask(_background_export),
++        background=BackgroundTask(
++            _run_auto_export,
++            session=session,
++            filename=filename,
++            extension="md",
++            revision=revision,
++            produce=_produce_markdown,
++            mark_exported=lambda: session_view.mark_auto_export_md(
++                generation=generation
++            ),
++        ),
+     )
+ 
+ 
+@@ -674,18 +742,20 @@ async def auto_export_as_ipynb(
+                 unnotified_packages,
+             )
+             session_view.notified_server_packages.update(unnotified_packages)
+-        session_view.mark_auto_export_ipynb()
++        # No file is written, so the export must stay pending: the next
++        # poll retries automatically once the dependencies are installed.
+         return PlainTextResponse(status_code=HTTPStatus.NOT_MODIFIED)
+ 
+     filename = session.app_file_manager.filename
++    assert filename is not None  # guaranteed by is_notebook_named above
+     generation = session_view.auto_export_generation
+     revision = auto_exporter.reserve_revision(filename, "ipynb")
+ 
+-    async def _background_export() -> None:
++    def _produce_ipynb() -> str:
+         # Reload the file manager to get the latest state
+         session.app_file_manager.reload()
+ 
+-        ipynb = Exporter().export_as_ipynb(
++        return Exporter().export_as_ipynb(
+             IPYNBExportRequest(
+                 app=session.app_file_manager.app,
+                 options=IPYNBExportOptions(sort_mode="top-down"),
+@@ -693,20 +763,19 @@ async def auto_export_as_ipynb(
+             )
+         )
+ 
+-        # Save the IPYNB file to disk, at `.marimo/<filename>.ipynb`
+-        if session.app_file_manager.filename != filename:
+-            return
+-        committed = await auto_exporter.save_ipynb(
+-            filename=filename,
+-            ipynb=ipynb,
+-            revision=revision,
+-        )
+-        if committed:
+-            session_view.mark_auto_export_ipynb(generation=generation)
+-
+     return JSONResponse(
+         content=asdict(SuccessResponse()),
+-        background=BackgroundTask(_background_export),
++        background=BackgroundTask(
++            _run_auto_export,
++            session=session,
++            filename=filename,
++            extension="ipynb",
++            revision=revision,
++            produce=_produce_ipynb,
++            mark_exported=lambda: session_view.mark_auto_export_ipynb(
++                generation=generation
++            ),
++        ),
+     )
+ 
+ 
+diff --git a/marimo/_server/session_manager.py b/marimo/_server/session_manager.py
+index 70cb80b66..0463bb87b 100644
+--- a/marimo/_server/session_manager.py
++++ b/marimo/_server/session_manager.py
+@@ -443,6 +443,12 @@ class SessionManager:
+             self._app_host_pool.shutdown()
+         self.lsp_server.stop()
+         self._watcher_manager.stop_all()
++        # Close sessions first so in-flight auto-export tasks see them as
++        # closed and bail; then discard any export write still queued. Files
++        # are published atomically, so completed exports remain valid.
++        from marimo._server.api.endpoints.export import auto_exporter
++
++        auto_exporter.cleanup()
+ 
+     def should_send_code_to_frontend(self) -> bool:
+         """Returns True if the server can send messages to the frontend."""
+diff --git a/tests/_export/test_auto_exporter.py b/tests/_export/test_auto_exporter.py
+index 77033034e..12a00fe87 100644
+--- a/tests/_export/test_auto_exporter.py
++++ b/tests/_export/test_auto_exporter.py
+@@ -1,3 +1,4 @@
++# Copyright 2026 Marimo. All rights reserved.
+ import asyncio
+ import threading
+ from pathlib import Path
+@@ -5,6 +6,10 @@ from pathlib import Path
+ from marimo._export.exporter import AutoExporter
+ 
+ 
++def _list_temp_files(directory: Path) -> list[Path]:
++    return list(directory.glob("*.tmp"))
++
++
+ async def test_newer_auto_export_supersedes_an_older_write(
+     tmp_path: Path, monkeypatch
+ ) -> None:
+@@ -14,30 +19,180 @@ async def test_newer_auto_export_supersedes_an_older_write(
+     )
+     exporter = AutoExporter()
+     try:
+-        older_write_started = threading.Event()
+-        release_older_write = threading.Event()
++        older_stage_started = threading.Event()
++        release_older_stage = threading.Event()
++        original_stage = AutoExporter._stage_file_sync
+ 
+-        def write_file(filepath: Path, content: str) -> None:
++        def stage_file(tmp_file: Path, content: str) -> None:
+             if content == "older":
+-                older_write_started.set()
+-                assert release_older_write.wait(timeout=2)
+-            filepath.write_text(content)
++                older_stage_started.set()
++                assert release_older_stage.wait(timeout=2)
++            original_stage(tmp_file, content)
+ 
+-        monkeypatch.setattr(exporter, "_write_file_sync", write_file)
++        monkeypatch.setattr(exporter, "_stage_file_sync", stage_file)
+         older = exporter.reserve_revision("notebook.py", "html")
+         older_task = asyncio.create_task(
+             exporter.save_html("notebook.py", "older", revision=older)
+         )
+-        assert await asyncio.to_thread(older_write_started.wait, 2)
++        assert await asyncio.to_thread(older_stage_started.wait, 2)
+ 
+         newer = exporter.reserve_revision("notebook.py", "html")
+         newer_task = asyncio.create_task(
+             exporter.save_html("notebook.py", "newer", revision=newer)
+         )
+-        release_older_write.set()
++        release_older_stage.set()
+ 
+         assert not await older_task
+         assert await newer_task
+         assert (tmp_path / "notebook.html").read_text() == "newer"
++        # Staged temp files are either published or removed.
++        assert await asyncio.to_thread(_list_temp_files, tmp_path) == []
++    finally:
++        exporter.cleanup()
++
++
++async def test_different_formats_have_independent_revisions(
++    tmp_path: Path, monkeypatch
++) -> None:
++    monkeypatch.setattr(
++        "marimo._export.exporter.notebook_output_dir",
++        lambda _path: tmp_path,
++    )
++    exporter = AutoExporter()
++    try:
++        html_rev = exporter.reserve_revision("notebook.py", "html")
++        md_rev = exporter.reserve_revision("notebook.py", "md")
++
++        assert await exporter.save_html(
++            "notebook.py", "html-1", revision=html_rev
++        )
++        assert await exporter.save_md("notebook.py", "md-1", revision=md_rev)
++
++        # A newer HTML revision must not invalidate the committed Markdown.
++        html_rev_2 = exporter.reserve_revision("notebook.py", "html")
++        assert not await exporter.save_html(
++            "notebook.py", "html-stale", revision=html_rev
++        )
++        assert await exporter.save_html(
++            "notebook.py", "html-2", revision=html_rev_2
++        )
++
++        assert (tmp_path / "notebook.html").read_text() == "html-2"
++        assert (tmp_path / "notebook.md").read_text() == "md-1"
++    finally:
++        exporter.cleanup()
++
++
++async def test_stale_revision_is_dropped_without_touching_the_file(
++    tmp_path: Path, monkeypatch
++) -> None:
++    monkeypatch.setattr(
++        "marimo._export.exporter.notebook_output_dir",
++        lambda _path: tmp_path,
++    )
++    exporter = AutoExporter()
++    try:
++        revision = exporter.reserve_revision("notebook.py", "ipynb")
++        exporter.reserve_revision("notebook.py", "ipynb")  # supersedes
++
++        assert not await exporter.save_ipynb(
++            "notebook.py", "stale", revision=revision
++        )
++        assert not (tmp_path / "notebook.ipynb").exists()
++        assert await asyncio.to_thread(_list_temp_files, tmp_path) == []
++    finally:
++        exporter.cleanup()
++
++
++async def test_empty_export_is_not_published(
++    tmp_path: Path, monkeypatch
++) -> None:
++    monkeypatch.setattr(
++        "marimo._export.exporter.notebook_output_dir",
++        lambda _path: tmp_path,
++    )
++    exporter = AutoExporter()
++    try:
++        revision = exporter.reserve_revision("notebook.py", "md")
++        assert not await exporter.save_md("notebook.py", "", revision=revision)
++        assert not (tmp_path / "notebook.md").exists()
++        assert await asyncio.to_thread(_list_temp_files, tmp_path) == []
++    finally:
++        exporter.cleanup()
++
++
++async def test_cleanup_discards_inflight_revisions_but_allows_new_exports(
++    tmp_path: Path, monkeypatch
++) -> None:
++    monkeypatch.setattr(
++        "marimo._export.exporter.notebook_output_dir",
++        lambda _path: tmp_path,
++    )
++    exporter = AutoExporter()
++    revision = exporter.reserve_revision("notebook.py", "html")
++    exporter.cleanup()
++
++    # A revision reserved before shutdown is discarded.
++    assert not await exporter.save_html(
++        "notebook.py", "before-shutdown", revision=revision
++    )
++    assert not (tmp_path / "notebook.html").exists()
++
++    # A later export works again from a clean slate (reopened notebook).
++    exporter = AutoExporter()
++    monkeypatch.setattr(
++        "marimo._export.exporter.notebook_output_dir",
++        lambda _path: tmp_path,
++    )
++    try:
++        new_revision = exporter.reserve_revision("notebook.py", "html")
++        assert new_revision == 1
++        assert await exporter.save_html(
++            "notebook.py", "after-reopen", revision=new_revision
++        )
++        assert (tmp_path / "notebook.html").read_text() == "after-reopen"
++    finally:
++        exporter.cleanup()
++
++
++async def test_cleanup_during_staging_discards_the_write(
++    tmp_path: Path, monkeypatch
++) -> None:
++    monkeypatch.setattr(
++        "marimo._export.exporter.notebook_output_dir",
++        lambda _path: tmp_path,
++    )
++    exporter = AutoExporter()
++    stage_started = threading.Event()
++    release_stage = threading.Event()
++    original_stage = AutoExporter._stage_file_sync
++
++    def stage_file(tmp_file: Path, content: str) -> None:
++        stage_started.set()
++        assert release_stage.wait(timeout=2)
++        original_stage(tmp_file, content)
++
++    monkeypatch.setattr(exporter, "_stage_file_sync", stage_file)
++    revision = exporter.reserve_revision("notebook.py", "html")
++    write_task = asyncio.create_task(
++        exporter.save_html("notebook.py", "in-flight", revision=revision)
++    )
++    assert await asyncio.to_thread(stage_started.wait, 2)
++
++    # Server shutdown while the write is in flight must discard the result.
++    exporter.cleanup()
++    release_stage.set()
++    assert not await write_task
++    assert not (tmp_path / "notebook.html").exists()
++    assert await asyncio.to_thread(_list_temp_files, tmp_path) == []
++
++    # The exporter is reusable from a clean epoch afterwards.
++    try:
++        new_revision = exporter.reserve_revision("notebook.py", "html")
++        assert new_revision == 1
++        assert await exporter.save_html(
++            "notebook.py", "after-reopen", revision=new_revision
++        )
++        assert (tmp_path / "notebook.html").read_text() == "after-reopen"
+     finally:
+         exporter.cleanup()
+diff --git a/tests/_server/api/endpoints/test_export.py b/tests/_server/api/endpoints/test_export.py
+index af1b67af2..6167c32df 100644
+--- a/tests/_server/api/endpoints/test_export.py
++++ b/tests/_server/api/endpoints/test_export.py
+@@ -1053,8 +1053,16 @@ def test_auto_export_html_skips_a_renamed_notebook(
+     tasks: list[Callable[[], Awaitable[None]]] = []
+ 
+     class DeferredBackgroundTask:
+-        def __init__(self, task: Callable[[], Awaitable[None]]) -> None:
+-            tasks.append(task)
++        def __init__(
++            self,
++            task: Callable[..., Awaitable[None]],
++            *args: object,
++            **kwargs: object,
++        ) -> None:
++            async def run() -> None:
++                await task(*args, **kwargs)
++
++            tasks.append(run)
+ 
+         async def __call__(self) -> None:
+             return
+@@ -1078,6 +1086,119 @@ def test_auto_export_html_skips_a_renamed_notebook(
+     asyncio.run(tasks[0]())
+ 
+     assert not old_export.exists()
++    # The renamed-away export stays pending for the current notebook.
++    assert session.session_view.needs_export("html")
++
++
++@with_session(SESSION_ID)
++def test_auto_export_html_failure_keeps_pending_and_retries(
++    client: TestClient, temp_marimo_file: str
++) -> None:
++    session = get_session_manager(client).get_session(SESSION_ID)
++    assert session
++    session.app_file_manager = AppFileManager(temp_marimo_file)
++    session.session_view.add_notification(
++        CellNotification(
++            cell_id=CellId_t("new_cell"),
++            output=CellOutput.stdout("hello"),
++        )
++    )
++
++    # A successful Markdown export must survive a failing HTML export.
++    response = client.post(
++        "/api/export/auto_export/markdown",
++        headers=HEADERS,
++        json={"download": False},
++    )
++    assert response.status_code == 200
++
++    html_file = Path(temp_marimo_file).parent / "__marimo__" / "notebook.html"
++    with patch(
++        "marimo._server.api.endpoints.export.Exporter.export_as_html",
++        side_effect=RuntimeError("boom"),
++    ):
++        response = client.post(
++            "/api/export/auto_export/html",
++            headers=HEADERS,
++            json={"download": False, "files": [], "includeCode": True},
++        )
++        assert response.status_code == 200
++
++    # The failed export is not marked done and leaves no file behind...
++    assert session.session_view.needs_export("html")
++    assert not html_file.exists()
++    # ...while the other format is unaffected.
++    assert not session.session_view.needs_export("md")
++
++    # The next poll retries and succeeds.
++    response = client.post(
++        "/api/export/auto_export/html",
++        headers=HEADERS,
++        json={"download": False, "files": [], "includeCode": True},
++    )
++    assert response.status_code == 200
++    assert html_file.exists()
++    assert not session.session_view.needs_export("html")
++
++    assert (
++        client.post(
++            "/api/export/auto_export/html",
++            headers=HEADERS,
++            json={"download": False, "files": [], "includeCode": True},
++        ).status_code
++        == 304
++    )
++
++
++@with_session(SESSION_ID)
++def test_auto_export_html_discarded_when_session_closes(
++    client: TestClient, temp_marimo_file: str
++) -> None:
++    session = get_session_manager(client).get_session(SESSION_ID)
++    assert session
++    session.app_file_manager = AppFileManager(temp_marimo_file)
++    session.session_view.add_notification(
++        CellNotification(
++            cell_id=CellId_t("new_cell"),
++            output=CellOutput.stdout("hello"),
++        )
++    )
++
++    tasks: list[Callable[[], Awaitable[None]]] = []
++
++    class DeferredBackgroundTask:
++        def __init__(
++            self,
++            task: Callable[..., Awaitable[None]],
++            *args: object,
++            **kwargs: object,
++        ) -> None:
++            async def run() -> None:
++                await task(*args, **kwargs)
++
++            tasks.append(run)
++
++        async def __call__(self) -> None:
++            return
++
++    with patch(
++        "marimo._server.api.endpoints.export.BackgroundTask",
++        DeferredBackgroundTask,
++    ):
++        response = client.post(
++            "/api/export/auto_export/html",
++            headers=HEADERS,
++            json={"download": False, "files": [], "includeCode": True},
++        )
++    assert response.status_code == 200
++    assert len(tasks) == 1
++
++    get_session_manager(client).close_session(SESSION_ID)
++    asyncio.run(tasks[0]())
++
++    html_file = Path(temp_marimo_file).parent / "__marimo__" / "notebook.html"
++    assert not html_file.exists()
++    assert session.session_view.needs_export("html")
+ 
+ 
+ @with_session(SESSION_ID)
+@@ -1246,8 +1367,11 @@ def test_auto_export_ipynb_missing_nbformat_notifies_once(
+         assert response.status_code == 304
+         mock_notify.assert_called_once_with(session, SESSION_ID, ["nbformat"])
+ 
+-        # Reset the export guard to exercise package notification deduplication.
+-        session.session_view.needs_export = lambda _: True
++        # No file was written, so the export must stay pending rather than
++        # being reported as exported.
++        assert session.session_view.needs_export("ipynb")
++
++        # The next poll retries without re-notifying (dedup), still pending.
+         response = client.post(
+             "/api/export/auto_export/ipynb",
+             headers=HEADERS,
+@@ -1255,6 +1379,27 @@ def test_auto_export_ipynb_missing_nbformat_notifies_once(
+         )
+         assert response.status_code == 304
+         assert mock_notify.call_count == 1
++        assert session.session_view.needs_export("ipynb")
++
++    # Once the dependency is available, the pending export runs on the
++    # next poll without requiring another save.
++    if DependencyManager.nbformat.has():
++        response = client.post(
++            "/api/export/auto_export/ipynb",
++            headers=HEADERS,
++            json={"download": False},
++        )
++        assert response.status_code == 200
++        assert response.json() == {"success": True}
++        assert not session.session_view.needs_export("ipynb")
++        assert (
++            client.post(
++                "/api/export/auto_export/ipynb",
++                headers=HEADERS,
++                json={"download": False},
++            ).status_code
++            == 304
++        )
+ 
+ 
+ @pytest.mark.skipif(

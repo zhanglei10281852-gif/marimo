@@ -3,8 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import os
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -876,7 +880,33 @@ async def render_pdf(request: PDFExportRequest) -> bytes | None:
 AutoExportFormat = Literal["html", "md", "ipynb"]
 
 
+@dataclass
+class _ExportSlot:
+    """Revision state for a single export output path.
+
+    The lock is a threading lock because the revision check and the
+    atomic file publish run partly in worker threads and must not
+    interleave.
+    """
+
+    revision: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
 class AutoExporter:
+    """Publishes auto-exported files with per-output-path revisioning.
+
+    Each save carries a revision from `reserve_revision`. A save is only
+    published when its revision is still current, so a slow older export
+    can never overwrite a newer notebook version. Output paths include
+    the format, so different formats have independent slots and never
+    cancel each other.
+
+    Writes are atomic (same-directory temp file + `os.replace`): a
+    reader sees either the previous complete file or the new one, never
+    a partially written artifact.
+    """
+
     def __init__(self) -> None:
         # Cache directories we've already created to avoid redundant checks
         self._created_dirs: set[Path] = set()
@@ -884,8 +914,11 @@ class AutoExporter:
         self._executor = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="export"
         )
-        self._latest_revisions: dict[Path, int] = {}
-        self._file_locks: dict[Path, asyncio.Lock] = {}
+        self._slots: dict[Path, _ExportSlot] = {}
+        self._temp_counter = 0
+        # Bumped on cleanup(); a save in flight across a cleanup can never
+        # commit into the new (shutting down / reopened) epoch.
+        self._epoch = 0
 
     @staticmethod
     def _export_path(
@@ -895,13 +928,31 @@ class AutoExporter:
         download_name = get_download_filename(filename, extension)
         return notebook_output_dir(notebook_path) / download_name
 
+    def _slot_for(self, filepath: Path) -> _ExportSlot:
+        slot = self._slots.get(filepath)
+        if slot is None:
+            slot = _ExportSlot()
+            self._slots[filepath] = slot
+        return slot
+
     def reserve_revision(
         self, filename: str | None, extension: AutoExportFormat
     ) -> int:
         filepath = self._export_path(filename, extension)
-        revision = self._latest_revisions.get(filepath, 0) + 1
-        self._latest_revisions[filepath] = revision
-        return revision
+        slot = self._slot_for(filepath)
+        with slot.lock:
+            slot.revision += 1
+            return slot.revision
+
+    async def save(
+        self,
+        filename: str | None,
+        content: str,
+        *,
+        extension: AutoExportFormat,
+        revision: int,
+    ) -> bool:
+        return await self._save_file(filename, content, extension, revision)
 
     async def _save_file(
         self,
@@ -910,18 +961,58 @@ class AutoExporter:
         extension: AutoExportFormat,
         revision: int,
     ) -> bool:
+        # An empty export is never a fully-written artifact, so keep the
+        # pending state and let the next save retry.
+        if not content:
+            return False
+
         filepath = self._export_path(filename, extension)
-        lock = self._file_locks.setdefault(filepath, asyncio.Lock())
-        async with lock:
-            if revision != self._latest_revisions.get(filepath):
+        slot = self._slot_for(filepath)
+
+        # Fast path: don't stage bytes for a revision that is already stale.
+        with slot.lock:
+            if slot.revision != revision:
                 return False
 
-            await self._ensure_export_dir_async(filepath.parent)
+        await self._ensure_export_dir_async(filepath.parent)
+        tmp_path = self._create_temp_path(filepath)
+        epoch = self._epoch
+        committed = False
+        try:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
-                self._executor, self._write_file_sync, filepath, content
+                self._executor, self._stage_file_sync, tmp_path, content
             )
-            return revision == self._latest_revisions.get(filepath)
+            # The commit re-checks the revision under the slot lock right
+            # before os.replace, so a revision reserved while staging can't
+            # be overwritten by the older bytes.
+            committed = await loop.run_in_executor(
+                self._executor,
+                self._commit_file_sync,
+                tmp_path,
+                filepath,
+                slot,
+                revision,
+                epoch,
+            )
+            return committed
+        except (RuntimeError, OSError):
+            # RuntimeError: the executor was shut down (server stopping).
+            # OSError: staging failed. Leave the pending state untouched so
+            # the next save or dependency recovery retries the export.
+            LOGGER.warning(
+                "Failed to auto-export %s; it will be retried on next save",
+                filepath,
+                exc_info=True,
+            )
+            return False
+        finally:
+            if not committed:
+                # On shutdown the staging thread may still hold the file
+                # open (notably on Windows); a leaked temp file is never
+                # published, so just leave it for the OS to clean up.
+                with contextlib.suppress(OSError):
+                    tmp_path.unlink()
 
     async def save_html(
         self, filename: str | None, html: str, *, revision: int
@@ -938,11 +1029,33 @@ class AutoExporter:
     ) -> bool:
         return await self._save_file(filename, ipynb, "ipynb", revision)
 
-    def _write_file_sync(self, filepath: Path, content: str) -> None:
-        """Synchronous file write (runs in thread pool)"""
-        if content == "":
-            return
-        filepath.write_text(content, encoding="utf-8")
+    def _create_temp_path(self, filepath: Path) -> Path:
+        # Unique within the process; same directory as the target so the
+        # final os.replace is atomic on every platform.
+        self._temp_counter += 1
+        name = f".{filepath.name}.{os.getpid()}.{self._temp_counter}.tmp"
+        return filepath.parent / name
+
+    @staticmethod
+    def _stage_file_sync(tmp_path: Path, content: str) -> None:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+
+    def _commit_file_sync(
+        self,
+        tmp_path: Path,
+        filepath: Path,
+        slot: _ExportSlot,
+        revision: int,
+        epoch: int,
+    ) -> bool:
+        with slot.lock:
+            if self._epoch != epoch or slot.revision != revision:
+                return False
+            os.replace(tmp_path, filepath)
+            return True
 
     async def _ensure_export_dir_async(self, export_dir: Path) -> None:
         """Async directory creation with caching to avoid redundant checks"""
@@ -956,10 +1069,22 @@ class AutoExporter:
         self._created_dirs.add(export_dir)
 
     def cleanup(self) -> None:
-        """Cleanup resources"""
-        self._executor.shutdown(wait=False)
-        self._latest_revisions.clear()
-        self._file_locks.clear()
+        """Discard unfinished export work and reset to a fresh state.
+
+        Queued writes are cancelled and all pending revisions are dropped,
+        so a save in flight fails its revision check instead of publishing
+        into a shutting-down server; a write that already reached the
+        atomic replace finishes as a complete file. New exports afterwards
+        start from a clean slate (a reopened notebook regenerates its
+        files).
+        """
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._executor = ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="export"
+        )
+        self._slots.clear()
+        self._created_dirs.clear()
+        self._epoch += 1
 
 
 def get_html_contents() -> str:

@@ -1,6 +1,7 @@
 # Copyright 2026 Marimo. All rights reserved.
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -28,6 +29,7 @@ from marimo._export.dependencies import (
 )
 from marimo._export.exporter import (
     AutoExporter,
+    AutoExportFormat,
     Exporter,
     export_markdown,
     export_script,
@@ -74,10 +76,15 @@ from marimo._server.api.utils import (
 )
 from marimo._server.models.models import SuccessResponse
 from marimo._server.router import APIRouter
+from marimo._session.model import ConnectionState
 from marimo._utils.http import HTTPStatus
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from starlette.requests import Request
+
+    from marimo._session.session import Session
 
 LOGGER = _loggers.marimo_logger()
 
@@ -85,6 +92,65 @@ LOGGER = _loggers.marimo_logger()
 router = APIRouter()
 
 auto_exporter = AutoExporter()
+
+
+def _auto_export_still_current(session: Session, filename: str) -> bool:
+    """Whether an export captured for `filename` may still be published.
+
+    A session close/server shutdown or a notebook rename both invalidate
+    any in-flight export, regardless of its revision.
+    """
+    if session.connection_state() is ConnectionState.CLOSED:
+        return False
+    return session.app_file_manager.filename == filename
+
+
+async def _run_auto_export(
+    *,
+    session: Session,
+    filename: str,
+    extension: AutoExportFormat,
+    revision: int,
+    produce: Callable[[], str],
+    mark_exported: Callable[[], bool],
+) -> None:
+    """Produce and publish one auto-export file in the background.
+
+    The exported state is only marked once the bytes for the matching
+    revision have been atomically written to the matching output path.
+    Stale revisions, renames, closed sessions, and producer failures leave
+    the pending state untouched, so the next poll or save retries.
+    """
+    try:
+        if not _auto_export_still_current(session, filename):
+            return
+
+        content = produce()
+
+        # Producing the export is blocking; the notebook may have been
+        # renamed or the session closed while it ran.
+        if not _auto_export_still_current(session, filename):
+            return
+
+        committed = await auto_exporter.save(
+            filename=filename,
+            content=content,
+            extension=extension,
+            revision=revision,
+        )
+        if committed and _auto_export_still_current(session, filename):
+            mark_exported()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # Keep the pending state so dependency recovery or the next save
+        # retries; an older failed task must not mark anything exported.
+        LOGGER.warning(
+            "Auto-export of %s for %s failed; it will be retried on next save",
+            extension,
+            filename,
+            exc_info=True,
+        )
 
 
 async def _get_export_format_availability(
@@ -324,10 +390,11 @@ async def auto_export_as_html(
         return PlainTextResponse(status_code=HTTPStatus.NOT_MODIFIED)
 
     filename = session.app_file_manager.filename
+    assert filename is not None  # guaranteed by is_notebook_named above
     generation = session_view.auto_export_generation
     revision = auto_exporter.reserve_revision(filename, "html")
 
-    async def _background_export() -> None:
+    def _produce_html() -> str:
         app = session.app_file_manager.app
         html, _filename = Exporter().export_as_html(
             HTMLExportRequest(
@@ -345,21 +412,21 @@ async def auto_export_as_html(
                 layout=layout,
             )
         )
-
-        # Save the HTML file to disk, at `.marimo/<filename>.html`
-        if session.app_file_manager.filename != filename:
-            return
-        committed = await auto_exporter.save_html(
-            filename=filename,
-            html=html,
-            revision=revision,
-        )
-        if committed:
-            session_view.mark_auto_export_html(layout, generation=generation)
+        return html
 
     return JSONResponse(
         content=asdict(SuccessResponse()),
-        background=BackgroundTask(_background_export),
+        background=BackgroundTask(
+            _run_auto_export,
+            session=session,
+            filename=filename,
+            extension="html",
+            revision=revision,
+            produce=_produce_html,
+            mark_exported=lambda: session_view.mark_auto_export_html(
+                layout, generation=generation
+            ),
+        ),
     )
 
 
@@ -581,10 +648,11 @@ async def auto_export_as_markdown(
         return PlainTextResponse(status_code=HTTPStatus.NOT_MODIFIED)
 
     filename = session.app_file_manager.filename
+    assert filename is not None  # guaranteed by is_notebook_named above
     generation = session_view.auto_export_generation
     revision = auto_exporter.reserve_revision(filename, "md")
 
-    async def _background_export() -> None:
+    def _produce_markdown() -> str:
         # Reload the file manager to get the latest state
         session.app_file_manager.reload()
 
@@ -594,21 +662,21 @@ async def auto_export_as_markdown(
                 options=MarkdownExportOptions(),
             )
         )
-
-        # Save the Markdown file to disk, at `.marimo/<filename>.md`
-        if session.app_file_manager.filename != filename:
-            return
-        committed = await auto_exporter.save_md(
-            filename=filename,
-            markdown=result.text,
-            revision=revision,
-        )
-        if committed:
-            session_view.mark_auto_export_md(generation=generation)
+        return result.text
 
     return JSONResponse(
         content=asdict(SuccessResponse()),
-        background=BackgroundTask(_background_export),
+        background=BackgroundTask(
+            _run_auto_export,
+            session=session,
+            filename=filename,
+            extension="md",
+            revision=revision,
+            produce=_produce_markdown,
+            mark_exported=lambda: session_view.mark_auto_export_md(
+                generation=generation
+            ),
+        ),
     )
 
 
@@ -674,18 +742,20 @@ async def auto_export_as_ipynb(
                 unnotified_packages,
             )
             session_view.notified_server_packages.update(unnotified_packages)
-        session_view.mark_auto_export_ipynb()
+        # No file is written, so the export must stay pending: the next
+        # poll retries automatically once the dependencies are installed.
         return PlainTextResponse(status_code=HTTPStatus.NOT_MODIFIED)
 
     filename = session.app_file_manager.filename
+    assert filename is not None  # guaranteed by is_notebook_named above
     generation = session_view.auto_export_generation
     revision = auto_exporter.reserve_revision(filename, "ipynb")
 
-    async def _background_export() -> None:
+    def _produce_ipynb() -> str:
         # Reload the file manager to get the latest state
         session.app_file_manager.reload()
 
-        ipynb = Exporter().export_as_ipynb(
+        return Exporter().export_as_ipynb(
             IPYNBExportRequest(
                 app=session.app_file_manager.app,
                 options=IPYNBExportOptions(sort_mode="top-down"),
@@ -693,20 +763,19 @@ async def auto_export_as_ipynb(
             )
         )
 
-        # Save the IPYNB file to disk, at `.marimo/<filename>.ipynb`
-        if session.app_file_manager.filename != filename:
-            return
-        committed = await auto_exporter.save_ipynb(
-            filename=filename,
-            ipynb=ipynb,
-            revision=revision,
-        )
-        if committed:
-            session_view.mark_auto_export_ipynb(generation=generation)
-
     return JSONResponse(
         content=asdict(SuccessResponse()),
-        background=BackgroundTask(_background_export),
+        background=BackgroundTask(
+            _run_auto_export,
+            session=session,
+            filename=filename,
+            extension="ipynb",
+            revision=revision,
+            produce=_produce_ipynb,
+            mark_exported=lambda: session_view.mark_auto_export_ipynb(
+                generation=generation
+            ),
+        ),
     )
 
 

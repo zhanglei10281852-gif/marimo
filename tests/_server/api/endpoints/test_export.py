@@ -1053,8 +1053,16 @@ def test_auto_export_html_skips_a_renamed_notebook(
     tasks: list[Callable[[], Awaitable[None]]] = []
 
     class DeferredBackgroundTask:
-        def __init__(self, task: Callable[[], Awaitable[None]]) -> None:
-            tasks.append(task)
+        def __init__(
+            self,
+            task: Callable[..., Awaitable[None]],
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            async def run() -> None:
+                await task(*args, **kwargs)
+
+            tasks.append(run)
 
         async def __call__(self) -> None:
             return
@@ -1078,6 +1086,119 @@ def test_auto_export_html_skips_a_renamed_notebook(
     asyncio.run(tasks[0]())
 
     assert not old_export.exists()
+    # The renamed-away export stays pending for the current notebook.
+    assert session.session_view.needs_export("html")
+
+
+@with_session(SESSION_ID)
+def test_auto_export_html_failure_keeps_pending_and_retries(
+    client: TestClient, temp_marimo_file: str
+) -> None:
+    session = get_session_manager(client).get_session(SESSION_ID)
+    assert session
+    session.app_file_manager = AppFileManager(temp_marimo_file)
+    session.session_view.add_notification(
+        CellNotification(
+            cell_id=CellId_t("new_cell"),
+            output=CellOutput.stdout("hello"),
+        )
+    )
+
+    # A successful Markdown export must survive a failing HTML export.
+    response = client.post(
+        "/api/export/auto_export/markdown",
+        headers=HEADERS,
+        json={"download": False},
+    )
+    assert response.status_code == 200
+
+    html_file = Path(temp_marimo_file).parent / "__marimo__" / "notebook.html"
+    with patch(
+        "marimo._server.api.endpoints.export.Exporter.export_as_html",
+        side_effect=RuntimeError("boom"),
+    ):
+        response = client.post(
+            "/api/export/auto_export/html",
+            headers=HEADERS,
+            json={"download": False, "files": [], "includeCode": True},
+        )
+        assert response.status_code == 200
+
+    # The failed export is not marked done and leaves no file behind...
+    assert session.session_view.needs_export("html")
+    assert not html_file.exists()
+    # ...while the other format is unaffected.
+    assert not session.session_view.needs_export("md")
+
+    # The next poll retries and succeeds.
+    response = client.post(
+        "/api/export/auto_export/html",
+        headers=HEADERS,
+        json={"download": False, "files": [], "includeCode": True},
+    )
+    assert response.status_code == 200
+    assert html_file.exists()
+    assert not session.session_view.needs_export("html")
+
+    assert (
+        client.post(
+            "/api/export/auto_export/html",
+            headers=HEADERS,
+            json={"download": False, "files": [], "includeCode": True},
+        ).status_code
+        == 304
+    )
+
+
+@with_session(SESSION_ID)
+def test_auto_export_html_discarded_when_session_closes(
+    client: TestClient, temp_marimo_file: str
+) -> None:
+    session = get_session_manager(client).get_session(SESSION_ID)
+    assert session
+    session.app_file_manager = AppFileManager(temp_marimo_file)
+    session.session_view.add_notification(
+        CellNotification(
+            cell_id=CellId_t("new_cell"),
+            output=CellOutput.stdout("hello"),
+        )
+    )
+
+    tasks: list[Callable[[], Awaitable[None]]] = []
+
+    class DeferredBackgroundTask:
+        def __init__(
+            self,
+            task: Callable[..., Awaitable[None]],
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            async def run() -> None:
+                await task(*args, **kwargs)
+
+            tasks.append(run)
+
+        async def __call__(self) -> None:
+            return
+
+    with patch(
+        "marimo._server.api.endpoints.export.BackgroundTask",
+        DeferredBackgroundTask,
+    ):
+        response = client.post(
+            "/api/export/auto_export/html",
+            headers=HEADERS,
+            json={"download": False, "files": [], "includeCode": True},
+        )
+    assert response.status_code == 200
+    assert len(tasks) == 1
+
+    get_session_manager(client).close_session(SESSION_ID)
+    asyncio.run(tasks[0]())
+
+    html_file = Path(temp_marimo_file).parent / "__marimo__" / "notebook.html"
+    assert not html_file.exists()
+    assert session.session_view.needs_export("html")
 
 
 @with_session(SESSION_ID)
@@ -1246,8 +1367,11 @@ def test_auto_export_ipynb_missing_nbformat_notifies_once(
         assert response.status_code == 304
         mock_notify.assert_called_once_with(session, SESSION_ID, ["nbformat"])
 
-        # Reset the export guard to exercise package notification deduplication.
-        session.session_view.needs_export = lambda _: True
+        # No file was written, so the export must stay pending rather than
+        # being reported as exported.
+        assert session.session_view.needs_export("ipynb")
+
+        # The next poll retries without re-notifying (dedup), still pending.
         response = client.post(
             "/api/export/auto_export/ipynb",
             headers=HEADERS,
@@ -1255,6 +1379,27 @@ def test_auto_export_ipynb_missing_nbformat_notifies_once(
         )
         assert response.status_code == 304
         assert mock_notify.call_count == 1
+        assert session.session_view.needs_export("ipynb")
+
+    # Once the dependency is available, the pending export runs on the
+    # next poll without requiring another save.
+    if DependencyManager.nbformat.has():
+        response = client.post(
+            "/api/export/auto_export/ipynb",
+            headers=HEADERS,
+            json={"download": False},
+        )
+        assert response.status_code == 200
+        assert response.json() == {"success": True}
+        assert not session.session_view.needs_export("ipynb")
+        assert (
+            client.post(
+                "/api/export/auto_export/ipynb",
+                headers=HEADERS,
+                json={"download": False},
+            ).status_code
+            == 304
+        )
 
 
 @pytest.mark.skipif(

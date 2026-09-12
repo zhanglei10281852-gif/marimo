@@ -443,6 +443,12 @@ class SessionManager:
             self._app_host_pool.shutdown()
         self.lsp_server.stop()
         self._watcher_manager.stop_all()
+        # Close sessions first so in-flight auto-export tasks see them as
+        # closed and bail; then discard any export write still queued. Files
+        # are published atomically, so completed exports remain valid.
+        from marimo._server.api.endpoints.export import auto_exporter
+
+        auto_exporter.cleanup()
 
     def should_send_code_to_frontend(self) -> bool:
         """Returns True if the server can send messages to the frontend."""
